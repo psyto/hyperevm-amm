@@ -325,8 +325,15 @@ contract HedgedPool {
         uint64 uSend = (usdcWei < uFree ? usdcWei : uFree) / 100 * 100; // EVM USDC has 6 decimals
         if (hSend == 0 && uSend == 0) revert TooSmall();
         if (msg.sender != keeper) {
-            // HYPE valued at the checked bid: a one-sided or crossed book reverts (review r7)
-            (uint256 bid,) = hSend > 0 ? coreBbo() : (0, 0);
+            // HYPE valued at the bid alone, which must exist (review r7). Not the full quote
+            // check: a wide or one-sided ask must not block bringing HYPE home for payouts
+            // (review r8).
+            uint256 bid;
+            if (hSend > 0) {
+                (uint64 b,) = Core.bbo(uint32(10_000 + spotIndex));
+                bid = _to6(b);
+                if (bid == 0) revert BadQuote(0, 0);
+            }
             if (uint256(hSend) * bid / 1e8 + uSend / 100 < MIN_NOTIONAL) revert TooSmall();
         }
         _quiet();

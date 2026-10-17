@@ -41,7 +41,7 @@ Details: [docs/design.md](docs/design.md).
 | `docs/step1-bridging.md` | testnet: moving HYPE and USDC between the EVM and Core from a contract |
 | `docs/step2-order-delay.md` | testnet: how long a CoreWriter order takes to run (10 IOCs, all < 1.5 s) |
 | `docs/step3-pool-testnet.md` | testnet: the pool, sell and buy legs, Core → EVM, a swap, exit |
-| `docs/reviews/` | Codex review rounds: payloads, outputs, PoCs, and what was fixed (`r1.md`–`r7.md`) |
+| `docs/reviews/` | Codex review rounds: payloads, outputs, PoCs, and what was fixed (`r1.md`–`r8.md`) |
 | `script/lib.sh` | rate-limit-safe `cast` helpers for the public testnet RPC |
 | `script/measure_order_delay.sh` | send IOCs from a contract and time them against their EVM block |
 | `script/core_send.py` | send USDC on HyperCore, or print an address's Core state (`--state`) |
@@ -50,7 +50,7 @@ Details: [docs/design.md](docs/design.md).
 ```
 forge test
 ```
-33 tests: CoreWriter encodings, and the pool against a simulated Core (mocked precompiles and a
+34 tests: CoreWriter encodings, and the pool against a simulated Core (mocked precompiles and a
 recording CoreWriter).
 
 ## Things HyperEVM taught (measured on testnet)

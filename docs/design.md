@@ -62,7 +62,7 @@ need it.
 | `add`, `remove`, `swapHypeForUsdc`, `swapUsdcForHype` | anyone | x·y=k with a 30 bp fee on `reserveH` / `reserveU`; wait out `quietUntil` |
 | `bridgeHype(amount)` | keeper | HYPE to the pool's Core account, to sell. Only when the pool is cheap, ≤ `maxRebalance`, ≥ 11 USDC, and only once the Core account exists (0x810; the keeper's `fundOps` creates it, so activation is the keeper's cost) |
 | `order(sellHype, amount)` | keeper | one IOC on the Core spot market, spending what is on Core, only when the price it would actually get beats the pool price: the bid less a 10 bp fee (sell) or the ask plus 10 bp (buy). Size ≤ `maxRebalance`; limit at the bid/ask; then `ORDER_QUIET` |
-| `toEvm(hypeWei, usdcWei)` | anyone | Core → EVM. Others must move ≥ 11 USDC worth (HYPE at the checked bid) and cannot take USDC below `effectiveFloor()`: the keeper's `floatFloor`, capped at 10% of all the pool's USDC so payouts never depend on the keeper alone |
+| `toEvm(hypeWei, usdcWei)` | anyone | Core → EVM. Others must move ≥ 11 USDC worth (HYPE at the bid, which must exist; a wide or one-sided ask does not block it, review r8) and cannot take USDC below `effectiveFloor()`: the keeper's `floatFloor`, capped at 10% of all the pool's USDC so payouts never depend on the keeper alone |
 | `fundOps()`, `setFloatFloor()` | keeper | ops float (Core HYPE for gas, not in reserves); the USDC floor |
 | first `add` | keeper | anything already in the pool would otherwise go to whoever mints first |
 
@@ -92,7 +92,7 @@ After r5 the pool was rebuilt on balances only (above). r6's main finding (tradi
 pending order) cannot be closed without a settlement signal from Core; it is covered by the
 30 s pause and accepted as a bounded risk. After r6 the pricing moved from the last trade to the
 best bid/ask and the pool ran on testnet both ways; r7 reviewed that change only (2 findings,
-fixed: fee-aware executable prices, quote checks).
+fixed: fee-aware executable prices, quote checks); r8 checked those fixes (1 finding, fixed).
 
 ## Open
 - `ORDER_QUIET` (30 s) is a time assumption. Testnet fills took < 1.5 s (n = 10); measure again

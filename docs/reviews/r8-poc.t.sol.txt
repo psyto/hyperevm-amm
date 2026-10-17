@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {Core, IERC20} from "../../src/Core.sol";
+import {HedgedPool} from "../../src/HedgedPool.sol";
+import {RecordingWriter} from "../CoreProbe.t.sol";
+
+contract R8MockUsdc {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+/// @dev Focused Round 8 checks of the r7 fixes. Core results are mocked after each write, as the
+///      pool itself learns of an IOC only through Core balances.
+contract R8FixPocTest is Test {
+    uint64 internal constant HYPE = 1105;
+    uint64 internal constant SPOT = 1035;
+    address internal constant KEEPER = address(0xCEE9);
+    address internal constant USER = address(0xB0B);
+
+    HedgedPool internal pool;
+    R8MockUsdc internal usdc;
+    RecordingWriter internal writer;
+
+    function setUp() public {
+        vm.etch(address(Core.WRITER), address(new RecordingWriter()).code);
+        writer = RecordingWriter(address(Core.WRITER));
+        usdc = new R8MockUsdc();
+        pool = new HedgedPool(IERC20(address(usdc)), KEEPER, HYPE, SPOT, 2);
+        _setCoreBalances(1e6, 0);
+        _setBbo(40e6, 40e6);
+
+        vm.deal(KEEPER, 100 ether);
+        usdc.mint(KEEPER, 4_000e6);
+        vm.startPrank(KEEPER);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 100 ether}(4_000e6, 0);
+        vm.stopPrank();
+    }
+
+    function _setBbo(uint64 bid, uint64 ask) internal {
+        vm.mockCall(Core.BBO, abi.encode(uint32(10_000 + SPOT)), abi.encode(bid, ask));
+    }
+
+    function _setCoreBalances(uint64 hypeWei, uint64 usdcWei) internal {
+        vm.mockCall(Core.SPOT_BALANCE, abi.encode(address(pool), HYPE), abi.encode(Core.SpotBalance(hypeWei, 0, 0)));
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(pool), Core.USDC), abi.encode(Core.SpotBalance(usdcWei, 0, 0))
+        );
+    }
+
+    function _sendHype(uint64 wei8) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            hex"0100000d",
+            abi.encode(Core.HYPE_SYSTEM, address(0), type(uint32).max, type(uint32).max, HYPE, wei8)
+        );
+    }
+
+    function _sendUsdc(uint64 wei8) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            hex"0100000d",
+            abi.encode(
+                Core.systemAddress(Core.USDC, HYPE), address(0), type(uint32).max, type(uint32).max, Core.USDC, wei8
+            )
+        );
+    }
+
+    /// The floor on a net bid and ceiling on a gross ask must not turn equality into a trade.
+    /// Both checks use a pool price of exactly 40.000000.
+    function test_poc_roundingAndExactExecutableBoundaryDoNotTrade() public {
+        // 40.040041 * (1 - 10 bp) = 40.000000959, floored to 40.000000.
+        _setBbo(40_040_041, 40_040_041);
+        (uint256 sellNet, uint256 buyGross,,) = pool.executable();
+        assertEq(sellNet, 40_000_000);
+        assertGt(buyGross, 40_000_000);
+
+        (bool sell, uint256 amount) = pool.maxRebalance();
+        assertFalse(sell);
+        assertEq(amount, 0, "pool price equal to the net bid must not sell");
+
+        vm.prank(KEEPER);
+        vm.expectRevert(HedgedPool.WrongDirection.selector);
+        pool.order(true, 1 ether);
+
+        // 39.960040 * (1 + 10 bp) = 40.000000040, ceiled to 40.000001.
+        _setBbo(39_000_000, 39_960_040);
+        (, buyGross,,) = pool.executable();
+        assertEq(buyGross, 40_000_001);
+        (sell, amount) = pool.maxRebalance();
+        assertFalse(sell);
+        assertEq(amount, 0, "pool price below the gross ask must not buy");
+    }
+
+    /// A wide book does intentionally block a non-keeper HYPE exit, but it cannot block the
+    /// keeper's recovery transfer or a USDC-only public transfer. These paths do not price HYPE.
+    function test_poc_invalidBookOnlyGatesNonKeeperHypeExit() public {
+        _setCoreBalances(1e6 + 2e8, 20e8);
+        _setBbo(40e6, 44e6); // 9.53% wide, so invalid for quote-dependent paths
+
+        vm.prank(KEEPER);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.WideBook.selector, 953));
+        pool.bridgeHype(1 ether);
+
+        vm.prank(USER);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.WideBook.selector, 953));
+        pool.toEvm(1e8, 0);
+
+        vm.prank(USER);
+        pool.toEvm(0, 20e8);
+        assertEq(writer.sent(0), _sendUsdc(20e8));
+
+        vm.roll(pool.quietUntil() + 1);
+        vm.prank(KEEPER);
+        pool.toEvm(1e8, 0);
+        assertEq(writer.sent(1), _sendHype(1e8));
+    }
+
+    /// Quote-independent AMM/LP paths remain callable even while Core's book is invalid.
+    function test_poc_invalidBookDoesNotFreezeSwapAddOrRemove() public {
+        _setBbo(0, 40e6);
+        vm.deal(USER, 3 ether);
+        usdc.mint(USER, 100e6);
+        vm.startPrank(USER);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 1 ether}(40e6, 0);
+        pool.swapHypeForUsdc{value: 0.1 ether}(0);
+        pool.remove(pool.shares(USER), 0, 0);
+        vm.stopPrank();
+    }
+
+    /// A public LP cannot restore EVM HYPE liquidity when the pool's HYPE is on Core and a
+    /// 5%-plus book rejects coreBbo(). The same withdrawal would be payable after moving HYPE
+    /// over, but the permissionless recovery path is quote-gated.
+    function test_poc_wideBookFreezesPublicHypeRecoveryNeededForWithdrawal() public {
+        vm.deal(USER, 2 ether);
+        usdc.mint(USER, 40e6);
+        vm.startPrank(USER);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 1 ether}(40e6, 0);
+        vm.stopPrank();
+
+        // 10,200 HYPE on Core is already counted, so USER's pro-rata HYPE claim exceeds the
+        // 101 HYPE available on EVM. This is the normal state a large rebalance can create.
+        _setCoreBalances(1e6 + 10_200e8, 0);
+        _setBbo(40e6, 44e6);
+
+        uint256 userShares = pool.shares(USER);
+        vm.prank(USER);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.NotEnoughEvmHype.selector, 101 ether));
+        pool.remove(userShares, 0, 0);
+
+        vm.prank(USER);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.WideBook.selector, 953));
+        pool.toEvm(10_200e8, 0);
+    }
+}

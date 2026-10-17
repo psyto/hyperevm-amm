@@ -495,11 +495,30 @@ contract HedgedPoolTest is Test {
         _setCoreBal(HYPE, 1e6 + 10e8);
         _setBbo(0, 1_000_000_000_000);
         vm.prank(trader);
-        vm.expectRevert(abi.encodeWithSelector(HedgedPool.BadQuote.selector, 0, 1_000_000_000_000));
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.BadQuote.selector, 0, 0));
         pool.toEvm(1, 0);
         _setCorePx(40_000_000);
         vm.prank(trader);
         vm.expectRevert(HedgedPool.TooSmall.selector);
         pool.toEvm(1, 0);
+    }
+
+    // ------------------------------------------------------------ review r8
+
+    /// r8 medium: a wide or one-sided ask cannot block bringing Core HYPE home for a withdrawal.
+    function test_r8_wideBookDoesNotBlockHypeRecovery() public {
+        _setCoreBal(HYPE, 1e6 + 100e8);
+        _setBbo(40_000_000, 44_000_000); // 9.5% wide: no trading
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.WideBook.selector, 953));
+        pool.order(true, 1 ether);
+        vm.prank(trader);
+        pool.toEvm(100e8, 0); // but recovery works
+        assertEq(writer.sent(0), _send(Core.HYPE_SYSTEM, HYPE, 100e8));
+
+        _setBbo(40_000_000, 0); // no ask at all
+        _pastQuiet();
+        vm.prank(trader);
+        pool.toEvm(100e8, 0);
     }
 }
