@@ -45,7 +45,8 @@ but nothing would be written off: it is counted when it lands.
 CoreWriter delays orders "a few seconds" and the EVM is never told when one runs. If the AMM
 kept trading meanwhile, someone could move the pool price around the order and keep the
 difference (review r6: +6.89 USDC on a 200 USDC sandwich). So `order` sets `ORDER_QUIET` = 30 s,
-about 10× the fill delay measured on testnet, during which swaps, liquidity and `toEvm` wait.
+during which swaps, liquidity and `toEvm` wait. Measured on testnet: 10 of 10 spot IOCs filled
+within 1.5 s of their block (docs/step2-order-delay.md), so 30 s is ~20× that.
 **This is a time assumption with no documented bound**, accepted as a risk (docs/reviews/r6.md):
 if an order ran later, the loss is bounded by that one order.
 
@@ -69,7 +70,8 @@ need it.
 A sell: `dh = (p·h − u) / 2p`. A buy: `du = (u − p·h) / 2`.
 
 ## Facts this rests on (measured on testnet)
-- CoreWriter writes run after the EVM block; IOC fills were visible ≤ 4 s later.
+- CoreWriter writes run after the EVM block. Spot IOCs filled 347–477 ms after the block
+  timestamp (n = 10, docs/step2-order-delay.md); a perp IOC was visible ≤ 4 s later.
 - Core → EVM credits do not call `receive()`; contracts only see a larger balance.
 - The first transfer into a new Core account pays account activation (1 USDC, or its value in
   HYPE taken from the transfer).
@@ -85,7 +87,8 @@ pending order) cannot be closed without a settlement signal from Core; it is cov
 
 ## Open
 - The pool has not run on testnet yet (needs ~1.5 testnet HYPE for an 11 USDC rebalance).
-- `ORDER_QUIET` (30 s) is a time assumption; to be backed by measured fill delays on testnet.
+- `ORDER_QUIET` (30 s) is a time assumption. Testnet fills took < 1.5 s (n = 10); measure again
+  on mainnet, where the delay may be longer.
 - Pausing: anyone moving ≥ 11 USDC of Core inventory to the EVM pauses swaps for 2 blocks;
   bounded by the inventory above the float floor.
 - HYPE on Core below the ops float is not counted (gas eats the float; the keeper tops it up).
