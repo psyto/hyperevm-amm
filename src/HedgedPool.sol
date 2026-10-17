@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.20;
 
-import {Core, ICoreDepositWallet, IERC20} from "./Core.sol";
+import {Core, IERC20} from "./Core.sol";
 
 /// @notice HYPE/USDC x·y=k pool that closes its own gap to the HyperCore spot price by trading
 /// on HyperCore, instead of leaving it to outside arbitrageurs. See docs/design.md.
 /// v1: the keeper is one address, and the pool is paused while a rebalance is in flight.
 ///
-/// Invariant: what leaves the EVM reserves for Core stays owed to the pool until it is seen back
-/// in the EVM balances. `sendBack` fixes what is owed once (`expectH`/`expectU`) and retries never
-/// lower it; `finish` only closes the round once the balances reach it.
+/// USDC lives in two places: on the EVM (`rU`) and on the pool's own Core account (the float,
+/// read through the spot-balance precompile). Both count as the pool's USDC. HYPE is bought on
+/// Core with the float, so USDC never has to cross EVM -> Core (that path did not credit a
+/// contract's Core account on testnet, docs/step1-bridging.md). Sales add to the float; the
+/// keeper brings float to the EVM when traders or LPs need it there.
+///
+/// Invariant: what leaves the EVM reserves or the float for the other side stays owed to the pool
+/// until it is seen there. `sendBack` fixes what is owed once (`expectH`/`expectU`) and retries
+/// never lower it; `finish` only closes the round once the EVM balances reach it.
 contract HedgedPool {
     enum Stage {
         Idle,
-        OnCore, // tokens bridged to the pool's Core account
+        OnCore, // sell: HYPE bridged to Core; buy: float earmarked
         Ordered, // IOC sent on the Core spot market
         Returning // Core balances sent back to the EVM
     }
@@ -21,7 +27,7 @@ contract HedgedPool {
     uint256 public constant FEE_BPS = 30;
     uint256 public constant SLIPPAGE_BPS = 100; // IOC limit vs Core spot price
     uint256 public constant ORDER_DELAY = 10; // seconds before `sendBack` may read the fill
-    uint256 public constant STUCK_DELAY = 1 hours; // after this, an unarrived bridge may be given up
+    uint256 public constant STUCK_DELAY = 1 hours; // after this, an unarrived HYPE bridge may be given up
     uint256 public constant MIN_NOTIONAL = 11e6; // USDC; Core spot rejects orders under 10 USDC
     /// HYPE kept on the pool's Core account to pay for Core -> EVM sends. Funded by the keeper
     /// through `fundOps`, not by LPs; `sendBack` returns everything above it.
@@ -29,25 +35,26 @@ contract HedgedPool {
     uint256 internal constant MIN_LIQUIDITY = 1000;
 
     IERC20 public immutable usdc;
-    address public immutable depositWallet;
     address public immutable keeper;
     uint64 public immutable hypeToken; // Core token index (testnet 1105, mainnet 150)
     uint64 public immutable spotIndex; // HYPE/USDC spot pair (testnet 1035, mainnet 107)
     uint8 public immutable hypeSzDecimals; // 2
 
     uint256 public rH; // HYPE, 18 decimals, held on the EVM
-    uint256 public rU; // USDC, 6 decimals, held on the EVM
+    uint256 public rU; // USDC, 6 decimals, held on the EVM (the float on Core is `coreU()`)
     uint256 public totalShares;
     mapping(address => uint256) public shares;
 
     Stage public stage;
     bool public sellingHype;
-    uint256 public inFlight; // amount taken out of rH (sell) or rU (buy) by `start`
-    uint64 public coreBefore; // Core balance of the bridged token when `start` ran
+    uint256 public inFlight; // sell: HYPE taken out of rH; buy: float (6 decimals) to spend
+    uint64 public coreBefore; // sell: Core HYPE balance when `start` ran
     uint256 public startedAt;
     uint256 public orderedAt;
     uint256 public expectH; // EVM balances `finish` waits for; fixed by the first `sendBack`
     uint256 public expectU;
+    uint64 public floatAfter; // Core USDC the first `sendBack` meant to leave on Core
+    uint256 public sentInBlock;
 
     event Swap(address indexed who, bool hypeIn, uint256 amountIn, uint256 amountOut);
     event Liquidity(address indexed who, int256 shareDelta, uint256 h, uint256 u);
@@ -61,18 +68,10 @@ contract HedgedPool {
     error TooMuch(uint256 max);
     error NotYet();
     error TooSmall();
-    error BuyDisabled();
+    error NotEnoughEvmUsdc(uint256 have);
 
-    constructor(
-        IERC20 usdc_,
-        address depositWallet_,
-        address keeper_,
-        uint64 hypeToken_,
-        uint64 spotIndex_,
-        uint8 hypeSzDecimals_
-    ) {
+    constructor(IERC20 usdc_, address keeper_, uint64 hypeToken_, uint64 spotIndex_, uint8 hypeSzDecimals_) {
         usdc = usdc_;
-        depositWallet = depositWallet_;
         keeper = keeper_;
         hypeToken = hypeToken_;
         spotIndex = spotIndex_;
@@ -105,7 +104,7 @@ contract HedgedPool {
             s = _sqrt(h * u) - MIN_LIQUIDITY;
             totalShares = MIN_LIQUIDITY; // locked
         } else {
-            s = _min(h * totalShares / rH, u * totalShares / rU);
+            s = _min(h * totalShares / rH, u * totalShares / reserveU());
         }
         if (s == 0 || s < minShares) revert Slippage();
         totalShares += s;
@@ -117,8 +116,9 @@ contract HedgedPool {
 
     function remove(uint256 s, uint256 minH, uint256 minU) external idle returns (uint256 h, uint256 u) {
         h = s * rH / totalShares;
-        u = s * rU / totalShares;
+        u = s * reserveU() / totalShares;
         if (h < minH || u < minU) revert Slippage();
+        if (u > rU) revert NotEnoughEvmUsdc(rU);
         shares[msg.sender] -= s;
         totalShares -= s;
         rH -= h;
@@ -131,8 +131,9 @@ contract HedgedPool {
     // ---------------------------------------------------------------- swaps
 
     function swapHypeForUsdc(uint256 minOut) external payable idle returns (uint256 out) {
-        out = _out(msg.value, rH, rU);
+        out = _out(msg.value, rH, reserveU());
         if (out < minOut) revert Slippage();
+        if (out > rU) revert NotEnoughEvmUsdc(rU);
         rH += msg.value;
         rU -= out;
         _sendUsdc(msg.sender, out);
@@ -141,7 +142,7 @@ contract HedgedPool {
 
     function swapUsdcForHype(uint256 u, uint256 minOut) external idle returns (uint256 out) {
         _pullUsdc(u);
-        out = _out(u, rU, rH);
+        out = _out(u, reserveU(), rH);
         if (out < minOut) revert Slippage();
         rU += u;
         rH -= out;
@@ -156,9 +157,19 @@ contract HedgedPool {
 
     // ---------------------------------------------------------------- rebalance
 
+    /// The USDC float on the pool's Core account, 6 decimals (Core has 8; the rest is dust).
+    function coreU() public view returns (uint256) {
+        return Core.spotBalance(address(this), Core.USDC).total / 100;
+    }
+
+    /// All the pool's USDC: EVM plus the Core float. Meaningful while `Idle`.
+    function reserveU() public view returns (uint256) {
+        return rU + coreU();
+    }
+
     /// Pool price, USDC per HYPE with 6 decimals.
     function poolPx() public view returns (uint256) {
-        return rU * 1e18 / rH;
+        return reserveU() * 1e18 / rH;
     }
 
     /// Core spot price, USDC per HYPE with 6 decimals.
@@ -171,7 +182,7 @@ contract HedgedPool {
     /// Most of the over-weight token that can be traded on Core without pushing the pool past the
     /// Core price: HYPE (18 decimals) when the pool is cheap, USDC (6 decimals) when it is dear.
     function maxRebalance() public view returns (bool sellHype, uint256 amount) {
-        return _maxRebalance(rH, rU, corePx());
+        return _maxRebalance(rH, reserveU(), corePx());
     }
 
     function _maxRebalance(uint256 h, uint256 u, uint256 p) internal pure returns (bool, uint256) {
@@ -191,14 +202,14 @@ contract HedgedPool {
         require(ok);
     }
 
-    /// Step 1: bridge `amount` of the over-weight token to the pool's Core account.
+    /// Step 1. Sell: bridge `amount` HYPE to the pool's Core account. Buy: earmark `amount` of
+    /// the Core float (6 decimals); nothing moves.
     function start(bool sellHype, uint256 amount) external at(Stage.Idle) {
         uint256 p = corePx();
-        (bool dir, uint256 max) = _maxRebalance(rH, rU, p);
+        (bool dir, uint256 max) = _maxRebalance(rH, reserveU(), p);
         if (dir != sellHype) revert WrongDirection();
         if (amount > max) revert TooMuch(max);
         if ((sellHype ? amount * p / 1e18 : amount) < MIN_NOTIONAL) revert TooSmall();
-        if (!sellHype && depositWallet == address(0)) revert BuyDisabled();
         sellingHype = sellHype;
         inFlight = amount;
         startedAt = block.timestamp;
@@ -208,18 +219,16 @@ contract HedgedPool {
             (bool ok,) = Core.HYPE_SYSTEM.call{value: amount}("");
             require(ok);
         } else {
-            coreBefore = Core.spotBalance(address(this), Core.USDC).total;
-            rU -= amount;
-            usdc.approve(depositWallet, amount);
-            ICoreDepositWallet(depositWallet).deposit(amount, Core.SPOT_DEX);
+            uint256 f = coreU();
+            if (amount > f) revert TooMuch(f);
         }
         stage = Stage.OnCore;
         emit Rebalance(Stage.OnCore, sellHype ? 1 : 0, amount);
     }
 
-    /// What has arrived on Core since `start`, in Core wei.
+    /// Sell leg: HYPE that has arrived on Core since `start`, in Core wei.
     function arrived() public view returns (uint64) {
-        uint64 nowBal = Core.spotBalance(address(this), sellingHype ? hypeToken : Core.USDC).total;
+        uint64 nowBal = Core.spotBalance(address(this), hypeToken).total;
         return nowBal > coreBefore ? nowBal - coreBefore : 0;
     }
 
@@ -229,20 +238,19 @@ contract HedgedPool {
     function order() external at(Stage.OnCore) {
         uint256 p = corePx(); // 6 decimals
         uint256 h = sellingHype ? rH + inFlight : rH;
-        uint256 u = sellingHype ? rU : rU + inFlight;
-        (bool dir, uint256 max) = _maxRebalance(h, u, p);
+        (bool dir, uint256 max) = _maxRebalance(h, reserveU(), p);
         if (dir != sellingHype || max == 0) revert WrongDirection();
 
         uint64 lotWei = uint64(10 ** (8 - hypeSzDecimals)); // size step, in 1e8 units
-        uint64 got = arrived();
         uint64 sz;
         uint256 limit;
         if (sellingHype) {
+            uint64 got = arrived();
             uint256 cap = max / 1e10; // 18 -> 8 decimals
             sz = uint64(got < cap ? got : cap) / lotWei * lotWei;
             limit = p * (10_000 - SLIPPAGE_BPS) / 10_000;
         } else {
-            uint256 spend = got < max * 100 ? got : max * 100; // USDC, 8 decimals
+            uint256 spend = _min(_min(inFlight, max), coreU()) * 100; // USDC, 8 decimals
             limit = p * (10_000 + SLIPPAGE_BPS) / 10_000;
             // HYPE (1e8 units) = USDC (1e8) / price (1e6) * 1e6
             sz = uint64(spend * 1e6 / limit) / lotWei * lotWei;
@@ -255,36 +263,43 @@ contract HedgedPool {
         emit Rebalance(Stage.Ordered, px, sz);
     }
 
-    /// Step 3: send everything on Core above the ops float back to the EVM.
+    /// Step 3: send HYPE above the ops float, and `uToEvm` (Core wei) of the USDC float, to the
+    /// EVM. The rest of the USDC stays on Core as float.
     /// - From `Ordered`, after `ORDER_DELAY` (the IOC has settled).
-    /// - From `OnCore` without trading, once the bridge has arrived or after `STUCK_DELAY`
-    ///   (a bridge that never arrives is then a recognised loss instead of a frozen pool).
-    /// - From `Returning` again, to resend whatever is still on Core (a dropped send).
+    /// - From `OnCore` without trading: a buy at any time; a sell once the HYPE has arrived, or
+    ///   after `STUCK_DELAY` (a bridge that never arrives is then a recognised loss).
+    /// - From `Idle`, to move float to the EVM.
+    /// - From `Returning` again, in a later block, to resend what a dropped send left on Core.
     /// The first call fixes `expectH`/`expectU`; later calls never change them, so a send whose
     /// Core debit has happened but whose EVM credit is pending stays owed.
-    function sendBack() external onlyKeeper {
+    function sendBack(uint64 uToEvm) external onlyKeeper {
         if (stage == Stage.Ordered) {
             if (block.timestamp < orderedAt + ORDER_DELAY) revert NotYet();
         } else if (stage == Stage.OnCore) {
-            if (arrived() == 0 && block.timestamp < startedAt + STUCK_DELAY) revert NotYet();
-        } else if (stage != Stage.Returning) {
-            revert WrongStage(Stage.Ordered);
+            if (sellingHype && arrived() == 0 && block.timestamp < startedAt + STUCK_DELAY) revert NotYet();
+        } else if (stage == Stage.Returning) {
+            if (block.number <= sentInBlock) revert NotYet(); // let Core process the first send
         }
         uint64 h = Core.spotBalance(address(this), hypeToken).total;
         uint64 u = Core.spotBalance(address(this), Core.USDC).total;
         uint64 hSend = h > KEEP_HYPE_WEI ? h - KEEP_HYPE_WEI : 0;
-        uint64 uSend = u / 100 * 100; // EVM USDC has 6 decimals, Core 8
+        uint64 uSend;
+        if (stage == Stage.Returning) {
+            uSend = u > floatAfter ? (u - floatAfter) / 100 * 100 : 0; // only what a dropped send left
+        } else {
+            uSend = (uToEvm < u ? uToEvm : u) / 100 * 100; // EVM USDC has 6 decimals, Core 8
+            floatAfter = u - uSend;
+            expectH = rH + uint256(hSend) * 1e10;
+            expectU = rU + uSend / 100;
+            stage = Stage.Returning;
+        }
         if (hSend > 0) {
             Core.sendAsset(Core.HYPE_SYSTEM, Core.SPOT_DEX, Core.SPOT_DEX, hypeToken, hSend);
         }
         if (uSend > 0) {
             Core.sendAsset(Core.systemAddress(Core.USDC, hypeToken), Core.SPOT_DEX, Core.SPOT_DEX, Core.USDC, uSend);
         }
-        if (stage != Stage.Returning) {
-            expectH = rH + uint256(hSend) * 1e10;
-            expectU = rU + uSend / 100;
-            stage = Stage.Returning;
-        }
+        sentInBlock = block.number;
         emit Rebalance(Stage.Returning, hSend, uSend);
     }
 
