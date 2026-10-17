@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {Core, IERC20} from "../../src/Core.sol";
+import {HedgedPool} from "../../src/HedgedPool.sol";
+import {RecordingWriter} from "../CoreProbe.t.sol";
+
+contract R9Token {
+    function balanceOf(address) external pure returns (uint256) {
+        return 0;
+    }
+}
+
+/// @dev Round 9: `toEvm` deliberately consumes only the bid for an unprivileged HYPE send.
+contract R9ToEvmQuotePocTest is Test {
+    uint64 internal constant HYPE = 1105;
+    uint64 internal constant SPOT = 1035;
+    address internal constant KEEPER = address(0xCEE9);
+    address internal constant USER = address(0xB0B);
+
+    HedgedPool internal pool;
+    RecordingWriter internal writer;
+
+    function setUp() public {
+        vm.etch(address(Core.WRITER), address(new RecordingWriter()).code);
+        writer = RecordingWriter(address(Core.WRITER));
+        pool = new HedgedPool(IERC20(address(new R9Token())), KEEPER, HYPE, SPOT, 2);
+        _coreH(pool.KEEP_HYPE_WEI() + 1e8);
+        _bbo(40e6, 40e6);
+    }
+
+    function _coreH(uint64 h) internal {
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(pool), HYPE), abi.encode(Core.SpotBalance(h, 0, 0))
+        );
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(pool), Core.USDC), abi.encode(Core.SpotBalance(0, 0, 0))
+        );
+    }
+
+    function _bbo(uint64 bid, uint64 ask) internal {
+        vm.mockCall(Core.BBO, abi.encode(uint32(10_000 + SPOT)), abi.encode(bid, ask));
+    }
+
+    function _hypeSend(uint64 h) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            hex"0100000d",
+            abi.encode(Core.HYPE_SYSTEM, address(0), type(uint32).max, type(uint32).max, HYPE, h)
+        );
+    }
+
+    /// r7's critical condition remains: no bid cannot value even a full-HYPE public recovery.
+    function test_poc_r9_zeroBidStillRejectsPublicHypeRecovery() public {
+        _bbo(0, type(uint64).max);
+        vm.prank(USER);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.BadQuote.selector, 0, 0));
+        pool.toEvm(1e8, 0);
+    }
+
+    /// A missing/wide ask no longer gates recovery, as intended by the r8 fix.
+    function test_poc_r9_oneSidedAskDoesNotBlockRecovery() public {
+        _bbo(40e6, 0);
+        vm.prank(USER);
+        pool.toEvm(1e8, 0);
+        assertEq(writer.sent(0), _hypeSend(1e8));
+    }
+
+    /// `toEvm` also accepts a crossed raw response. A real resting Core book cannot remain
+    /// crossed under price-time matching, and no arithmetic here can panic; this pins the exact
+    /// intentionally ask-independent behavior for review.
+    function test_poc_r9_crossedRawBboDoesNotBlockRecovery() public {
+        _bbo(40e6, 1);
+        vm.prank(USER);
+        pool.toEvm(1e8, 0);
+        assertEq(writer.sent(0), _hypeSend(1e8));
+    }
+
+    /// The keeper was always exempt from the public anti-grief minimum and remains able to move
+    /// an otherwise-dust amount without consulting BBO.
+    function test_poc_r9_keeperPathDoesNotReadQuoteOrMinimum() public {
+        _coreH(pool.KEEP_HYPE_WEI() + 1);
+        _bbo(0, 0);
+        vm.prank(KEEPER);
+        pool.toEvm(1, 0);
+        assertEq(writer.sent(0), _hypeSend(1));
+    }
+
+    /// One Core wei (1e-8 HYPE) needs a 1.1 billion USDC/HYPE bid to reach the 11-USDC
+    /// threshold. At HYPE's 0.01 lot size, that resting bid commits 11 million USDC, far beyond
+    /// the bounded two-block pause it can induce.
+    function test_poc_r9_extremeBidNeededForOneWeiDustAndItsCommitment() public {
+        uint64 bid = 1_100_000_000_000_000; // 1.1e9 USDC/HYPE, with 6 price decimals
+        _coreH(pool.KEEP_HYPE_WEI() + 1);
+        _bbo(bid, 0);
+
+        assertEq(uint256(bid) * 1 / 1e8, pool.MIN_NOTIONAL());
+        uint256 minLotWei = 1e6; // 0.01 HYPE in Core's 8-decimal units (szDecimals == 2)
+        assertEq(uint256(bid) * minLotWei / 1e6, 11_000_000e8, "USDC committed by the bid");
+
+        vm.prank(USER);
+        pool.toEvm(1, 0);
+        assertEq(writer.sent(0), _hypeSend(1));
+    }
+}

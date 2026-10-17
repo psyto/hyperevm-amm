@@ -92,7 +92,8 @@ After r5 the pool was rebuilt on balances only (above). r6's main finding (tradi
 pending order) cannot be closed without a settlement signal from Core; it is covered by the
 30 s pause and accepted as a bounded risk. After r6 the pricing moved from the last trade to the
 best bid/ask and the pool ran on testnet both ways; r7 reviewed that change only (2 findings,
-fixed: fee-aware executable prices, quote checks); r8 checked those fixes (1 finding, fixed).
+fixed: fee-aware executable prices, quote checks); r8 checked those fixes (1 finding, fixed);
+r9 checked that fix: **APPROVE**.
 
 ## Open
 - `ORDER_QUIET` (30 s) is a time assumption. Testnet fills took < 1.5 s (n = 10); measure again

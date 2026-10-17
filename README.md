@@ -6,7 +6,8 @@ to the HyperCore price by trading on HyperCore**, instead of leaving it to outsi
 Status (2026-10-17): a learning project, not audited, not for real funds. The pool has run on
 HyperEVM testnet in both directions against the real Core book (`docs/step3-pool-testnet.md`). Six adversarial review rounds by Codex: the first five found holes in
 the pool's own bookkeeping, so it was rebuilt to keep no books at all; the sixth found the one
-limit that remains (below). Reviews stop there.
+limit that remains (below). Rounds 7–9 covered the move to best bid/ask pricing and ended in
+APPROVE.
 
 ## How it works
 - **No books: reserves are balances.** HYPE and USDC on the EVM plus HYPE and USDC on the pool's
@@ -41,7 +42,7 @@ Details: [docs/design.md](docs/design.md).
 | `docs/step1-bridging.md` | testnet: moving HYPE and USDC between the EVM and Core from a contract |
 | `docs/step2-order-delay.md` | testnet: how long a CoreWriter order takes to run (10 IOCs, all < 1.5 s) |
 | `docs/step3-pool-testnet.md` | testnet: the pool, sell and buy legs, Core → EVM, a swap, exit |
-| `docs/reviews/` | Codex review rounds: payloads, outputs, PoCs, and what was fixed (`r1.md`–`r8.md`) |
+| `docs/reviews/` | Codex review rounds: payloads, outputs, PoCs, and what was fixed (`r1.md`–`r9.md`) |
 | `script/lib.sh` | rate-limit-safe `cast` helpers for the public testnet RPC |
 | `script/measure_order_delay.sh` | send IOCs from a contract and time them against their EVM block |
 | `script/core_send.py` | send USDC on HyperCore, or print an address's Core state (`--state`) |
