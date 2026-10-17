@@ -1,4 +1,4 @@
-# Pool design (draft)
+# Pool design
 
 A HYPE/USDC constant-product pool on HyperEVM that **arbitrages itself on HyperCore** instead of
 leaving the gap to outside arbitrageurs.
@@ -42,25 +42,37 @@ float is keeper-funded (`fundOps`).
 ## Rebalance (keeper, v1 owner-only)
 1. **start(sellHype, amount)** — sell: bridge HYPE to `0x2222…`. Buy: earmark `amount` of the float
    (must be ≤ `coreU()`); nothing moves. Both bounded by `maxRebalance` and `MIN_NOTIONAL`.
-2. **order()** — recheck the direction on current reserves, then one IOC on the Core spot market,
-   limit 1% off the Core spot price (0x808), rounded to the tick.
+2. **order()** — recheck the direction on current reserves (counting bridged HYPE not yet on
+   Core), then one IOC on the Core spot market. Limit: 1% off the Core spot price (0x808), but
+   never worse than the pool's own price (review r2: the order runs seconds later), rounded to
+   the tick away from a loss (sell up, buy down).
 3. **sendBack(uToEvm)** — after the order delay: HYPE above the ops float back to the EVM, plus
    `uToEvm` of the USDC float; the rest stays as float. Also callable from `Idle` to move float.
 4. **finish()** — when the EVM balances reach what was sent, set `rH`/`rU` to them and unpause.
 
 How far to rebalance: only toward the Core price, never past it — the amount that moves
-`reserveU/rH` to the Core mid, capped per call.
+`reserveU/reserveH` to the Core mid, capped per call.
 
-## Facts this rests on (measured on testnet, docs/step0-corewriter.md)
-- CoreWriter writes run after the EVM block; IOC fills were visible ≤ 4 s later.
+## Facts this rests on (measured on testnet, docs/step0-corewriter.md, docs/step1-bridging.md)
+- CoreWriter writes run after the EVM block; IOC fills were visible ≤ 4 s later. There is no
+  settlement signal on the EVM, hence counting both Core balances.
 - Core → EVM credits do **not** call `receive()`; the contract only sees a larger balance.
   So `finish()` must compare balances, not wait for a callback.
 - The first transfer into a new Core account pays account activation (1 USDC, or its value in
   HYPE taken from the transfer).
+- USDC EVM → Core into a contract's Core account did not arrive; Core → EVM arrived within 1 s.
+  A non-HYPE Core → EVM send uses Core HYPE for gas, hence the keeper-funded ops float.
 - Units: order `sz`/`limitPx` × 1e8; spot balances in token wei (HYPE 8, USDC 8); EVM HYPE 18,
   EVM USDC 6.
 
+## Reviews
+Codex, adversarial, with PoCs (docs/reviews/): r1 5 findings, r2 2, r3 2, all fixed with
+regression tests (`test_r1_*` … `test_r3_*`). r4 in progress.
+
 ## Open
-- Filling the float the first time: a sale, or a direct Core send to the pool's address (counts
-  as a donation to LPs).
+- The pool has not run on testnet yet (needs ~1.5 testnet HYPE for an 11 USDC rebalance).
+- Filling the float the first time: a sale, or a direct Core send to the pool's address before
+  the keeper's first mint.
+- HYPE on Core below the ops float is not counted (gas eats the float; the keeper tops it up).
 - Whether a keeper can be made permissionless (bounded by the 0x808 price and per-call caps).
+- Whether USDC EVM → Core into a contract works on mainnet (reported yes; untested).

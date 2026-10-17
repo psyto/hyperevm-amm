@@ -12,13 +12,16 @@ HyperEVM testnet, 2026-10-17. `CoreProbe` v2 at `<probe-2>`.
 | USDC EVM → Core, EOA `deposit` (control) | EOA approve + `deposit(1e6, spot)` | credited to the EOA within 1 s |
 
 So on testnet today, USDC sent through the deposit wallet **to a contract's Core account** did not
-arrive, whoever called it; to an EOA it did. Cause unknown. 5.5 testnet USDC are unaccounted for.
+arrive, whoever called it; to an EOA it did. 5.5 testnet USDC are unaccounted for (likely a testnet restriction, below).
 Before relying on it on mainnet, ask Circle/Hyperliquid or test with a dollar.
 
-## What it means for the pool
+## What it meant for the pool
 - Selling HYPE on Core works end to end: HYPE in through `0x2222…`, IOC on `@1035`, USDC back
-  through `0x2000…0000`. `finish()` has to compare balances, which it does.
-- Buying HYPE on Core cannot start from EVM USDC. Options: keep a USDC float on the pool's Core
-  account (filled by earlier HYPE sales) and count it through the spot-balance precompile, or
-  have the buy leg skip USDC entirely.
-- The pool's Core account must keep some HYPE for Core → EVM USDC sends (`KEEP_HYPE_WEI`).
+  through `0x2000…0000`. `finish()` compares balances, since nothing calls the contract.
+- Buying HYPE on Core could not start from EVM USDC, so the pool keeps a **USDC float on its own
+  Core account** (filled by sales, read through the spot-balance precompile) and USDC only moves
+  Core → EVM. See docs/design.md.
+- The pool's Core account keeps some HYPE for Core → EVM USDC sends (`KEEP_HYPE_WEI`, funded by
+  the keeper through `fundOps`).
+- Codex's search (docs/reviews/search-usdc.out.md) found the same symptom reported as a testnet
+  restriction (hyperliquid-dex/node issue #138); mainnet reportedly credits contracts.

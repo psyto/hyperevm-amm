@@ -37,5 +37,5 @@ USDC fees and spread.
   which is the only on-EVM trace of what was sent.
 
 ## Next
-The AMM step: a pool whose skew is hedged on HyperCore through these same actions, with the
-hedge reconciled by reading the position back in a later block.
+Done: moving tokens between the EVM and Core from a contract (docs/step1-bridging.md), then the
+pool (docs/design.md).
