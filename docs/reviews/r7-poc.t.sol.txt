@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {Core, IERC20} from "../../src/Core.sol";
+import {HedgedPool} from "../../src/HedgedPool.sol";
+import {RecordingWriter} from "../CoreProbe.t.sol";
+
+contract R7MockUsdc {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+/// @dev PoCs for the best bid/ask change. Core fills are represented by changing its mocked balances after the
+///      fire-and-forget writer action, exactly as the production contract observes them.
+contract R7BboPocTest is Test {
+    uint64 internal constant HYPE = 1105;
+    uint64 internal constant SPOT = 1035;
+    address internal constant KEEPER = address(0xCEE9);
+    address internal constant USER = address(0xB0B);
+
+    HedgedPool internal pool;
+    R7MockUsdc internal usdc;
+    RecordingWriter internal writer;
+
+    function setUp() public {
+        vm.etch(address(Core.WRITER), address(new RecordingWriter()).code);
+        writer = RecordingWriter(address(Core.WRITER));
+        usdc = new R7MockUsdc();
+        pool = new HedgedPool(IERC20(address(usdc)), KEEPER, HYPE, SPOT, 2);
+        _setCoreBalances(1e6, 0);
+
+        vm.deal(KEEPER, 100 ether);
+        usdc.mint(KEEPER, 4_000e6);
+        vm.startPrank(KEEPER);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 100 ether}(4_000e6, 0);
+        vm.stopPrank();
+    }
+
+    function _setBbo(uint64 bid, uint64 ask) internal {
+        vm.mockCall(Core.BBO, abi.encode(uint32(10_000 + SPOT)), abi.encode(bid, ask));
+    }
+
+    function _setCoreBalances(uint64 hypeWei, uint64 usdcWei) internal {
+        vm.mockCall(Core.SPOT_BALANCE, abi.encode(address(pool), HYPE), abi.encode(Core.SpotBalance(hypeWei, 0, 0)));
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(pool), Core.USDC), abi.encode(Core.SpotBalance(usdcWei, 0, 0))
+        );
+    }
+
+    /// A 40/42 book is under the 5% cap (487 bps). The midpoint says the pool is cheap, but the
+    /// IOC sells at 40, exactly the pool price. A base-tier 7 bp taker fee makes the LP lose the
+    /// $1 half-spread plus the $0.028 fee against the very midpoint used to justify the trade.
+    function test_poc_midpointAuthorizesSaleAtPoolPriceAndLosesSpreadAndFee() public {
+        _setCoreBalances(1e6 + 1e8, 40e8); // total reserves: 101 HYPE, 4,040 USDC; pool = 40
+        _setBbo(40e6, 42e6); // midpoint = 41, spread = 487 bps
+
+        uint256 valueBefore = pool.reserveU() + pool.reserveH() * pool.corePx() / 1e18;
+        vm.prank(KEEPER);
+        pool.order(true, 1 ether);
+
+        // The action's price is the bid (40), although the rebalance decision used 41.
+        assertEq(
+            writer.sent(0),
+            abi.encodePacked(
+                hex"01000001", abi.encode(uint32(11035), false, uint64(40e8), uint64(1e8), false, uint8(3), uint128(0))
+            )
+        );
+
+        // Model a complete Core fill at 40 less Hyperliquid's documented base 7 bp spot taker fee.
+        _setCoreBalances(1e6, 7_997_200_000); // existing $40 + $39.972 net proceeds, in Core 1e8 units
+        uint256 valueAfter = pool.reserveU() + pool.reserveH() * pool.corePx() / 1e18;
+        assertEq(valueBefore - valueAfter, 1_028_000, "LPs lose half-spread plus taker fee");
+    }
+
+    /// A BBO is not validated before corePx() prices the permissionless toEvm anti-grief gate.
+    /// With no bid and one far ask, a one-wei HYPE send is valued at >= $11 and pauses the pool.
+    function test_poc_oneSidedSpoofLetsOneWeiTransferPassMinNotionalAndPause() public {
+        _setCoreBalances(1e6 + 1, 0);
+        _setBbo(0, 2_200_000_000_000_000); // midpoint = 1.1e15 in USDC-6 units
+
+        assertEq(pool.corePx(), 1_100_000_000_000_000);
+        vm.prank(USER);
+        pool.toEvm(1, 0);
+
+        assertEq(writer.count(), 1);
+        assertGt(pool.quietUntil(), block.number, "a one-wei send obtains the two-block pause");
+    }
+
+    /// Crossed snapshots are not converted to a domain error: ask - bid panics before WideBook.
+    function test_poc_crossedBboPanicsInsteadOfRejectingInvalidQuote() public {
+        _setCoreBalances(1e6 + 1e8, 0);
+        _setBbo(42e6, 40e6);
+
+        vm.prank(KEEPER);
+        vm.expectRevert(abi.encodeWithSignature("Panic(uint256)", 0x11));
+        pool.order(true, 1 ether);
+    }
+}

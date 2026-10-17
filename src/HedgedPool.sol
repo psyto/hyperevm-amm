@@ -28,6 +28,9 @@ import {Core, IERC20} from "./Core.sol";
 contract HedgedPool {
     uint256 public constant FEE_BPS = 30;
     uint256 public constant MAX_SPREAD_BPS = 500; // no orders into a Core book wider than this
+    /// Core spot taker fee assumed when judging a trade, a little above the 7 bp base rate, so
+    /// the pool only trades when the price it actually gets beats its own (review r7).
+    uint256 public constant TAKER_FEE_BPS = 10;
     uint256 public constant MIN_NOTIONAL = 11e6; // USDC; Core spot rejects orders under 10 USDC
     uint256 public constant QUIET_BLOCKS = 2; // one block for the documented ordering, one spare
     uint256 public constant ORDER_QUIET = 30; // seconds; ~10x the measured fill delay (<= 4 s)
@@ -66,6 +69,7 @@ contract HedgedPool {
     error NotEnoughEvmHype(uint256 have);
     error NoCoreAccount();
     error WideBook(uint256 spreadBps);
+    error BadQuote(uint256 bid, uint256 ask);
 
     constructor(IERC20 usdc_, address keeper_, uint64 hypeToken_, uint64 spotIndex_, uint8 hypeSzDecimals_) {
         usdc = usdc_;
@@ -175,17 +179,29 @@ contract HedgedPool {
 
     // ---------------------------------------------------------------- rebalance (keeper)
 
-    /// Core best bid and ask, USDC per HYPE with 6 decimals. The last trade price (0x808) is not
+    /// Core best bid and ask, USDC per HYPE with 6 decimals, checked: both sides present, not
+    /// crossed, no wider than `MAX_SPREAD_BPS` (review r7). The last trade price (0x808) is not
     /// used: on a wide book it sits at one side, and a limit set off it may never fill (testnet).
     function coreBbo() public view returns (uint256 bid, uint256 ask) {
         (uint64 b, uint64 a) = Core.bbo(uint32(10_000 + spotIndex)); // 8 - szDecimals decimals
-        return (_to6(b), _to6(a));
+        (bid, ask) = (_to6(b), _to6(a));
+        if (bid == 0 || ask < bid) revert BadQuote(bid, ask);
+        uint256 spread = ((ask - bid) * 20_000 + (bid + ask) - 1) / (bid + ask); // bps of mid, rounded up
+        if (spread > MAX_SPREAD_BPS) revert WideBook(spread);
     }
 
-    /// Core mid price, USDC per HYPE with 6 decimals: what the pool rebalances toward.
+    /// Core mid price, USDC per HYPE with 6 decimals.
     function corePx() public view returns (uint256) {
         (uint256 bid, uint256 ask) = coreBbo();
         return (bid + ask) / 2;
+    }
+
+    /// The prices the pool would actually get on Core, after the taker fee: selling at the bid,
+    /// buying at the ask.
+    function executable() public view returns (uint256 sellNet, uint256 buyGross, uint256 bid, uint256 ask) {
+        (bid, ask) = coreBbo();
+        sellNet = bid * (10_000 - TAKER_FEE_BPS) / 10_000;
+        buyGross = (ask * (10_000 + TAKER_FEE_BPS) + 9_999) / 10_000;
     }
 
     function _to6(uint256 px) internal view returns (uint256) {
@@ -194,9 +210,23 @@ contract HedgedPool {
     }
 
     /// Most of the over-weight token that can be traded on Core without pushing the pool past the
-    /// Core price: HYPE (18 decimals) when the pool is cheap, USDC (6 decimals) when it is dear.
+    /// price it would actually get there: HYPE (18 decimals) to sell when the bid after fees is
+    /// above the pool price, USDC (6 decimals) to spend when the ask after fees is below it, and
+    /// nothing in between (review r7: sizing on the mid lost the spread and fees to LPs).
     function maxRebalance() public view returns (bool sellHype, uint256 amount) {
-        return _maxRebalance(reserveH(), reserveU(), corePx());
+        (uint256 sellNet, uint256 buyGross,,) = executable();
+        return _maxExecutable(reserveH(), reserveU(), sellNet, buyGross);
+    }
+
+    function _maxExecutable(uint256 h, uint256 u, uint256 sellNet, uint256 buyGross)
+        internal
+        pure
+        returns (bool, uint256)
+    {
+        uint256 pool = u * 1e18 / h;
+        if (sellNet > pool) return _maxRebalance(h, u, sellNet);
+        if (buyGross < pool) return _maxRebalance(h, u, buyGross);
+        return (false, 0);
     }
 
     function _maxRebalance(uint256 h, uint256 u, uint256 p) internal pure returns (bool, uint256) {
@@ -231,11 +261,11 @@ contract HedgedPool {
     /// Move `amount` HYPE (18 decimals) to the pool's Core account, to sell there. Only when the
     /// pool is cheap, and no more than `maxRebalance`.
     function bridgeHype(uint256 amount) external onlyKeeper settled {
-        uint256 p = corePx();
-        (bool sell, uint256 max) = _maxRebalance(reserveH(), reserveU(), p);
-        if (!sell) revert WrongDirection();
+        (bool sell, uint256 max) = maxRebalance();
+        if (!sell || max == 0) revert WrongDirection();
         if (amount > max) revert TooMuch(max);
-        if (amount * p / 1e18 < MIN_NOTIONAL) revert TooSmall();
+        (uint256 bid,) = coreBbo();
+        if (amount * bid / 1e18 < MIN_NOTIONAL) revert TooSmall();
         // the Core account must already exist (the keeper's `fundOps` creates it), so activation
         // is not paid out of LP HYPE (review r4). Not a balance threshold: gas for anyone's
         // `toEvm` would wear it down and block bridging (review r6).
@@ -247,17 +277,14 @@ contract HedgedPool {
     }
 
     /// One IOC on the Core spot market, spending at most `amount` of what is on Core (HYPE, 18
-    /// decimals, to sell; USDC, 6 decimals, to buy) and no more than `maxRebalance`. The limit is
-    /// the best bid (sell) or ask (buy), but never worse than the pool's own price: the order runs
-    /// later (review r2). No order into a book wider than `MAX_SPREAD_BPS`. If Core rejects it,
-    /// or it fills late, only counted balances change.
+    /// decimals, to sell; USDC, 6 decimals, to buy) and no more than `maxRebalance`. Only when the
+    /// price after fees beats the pool price; the limit is the best bid (sell) or ask (buy), so a
+    /// fill seconds later is at that price or better (review r2, r7). If Core rejects it, or it
+    /// fills late, only counted balances change.
     function order(bool sellHype, uint256 amount) external onlyKeeper settled {
-        (uint256 bid, uint256 ask) = coreBbo(); // 6 decimals
+        (uint256 sellNet, uint256 buyGross, uint256 bid, uint256 ask) = executable(); // 6 decimals
         uint256 p = (bid + ask) / 2;
-        uint256 spread = (ask - bid) * 10_000 / p;
-        if (spread > MAX_SPREAD_BPS) revert WideBook(spread);
-        uint256 pool = poolPx();
-        (bool dir, uint256 max) = _maxRebalance(reserveH(), reserveU(), p);
+        (bool dir, uint256 max) = _maxExecutable(reserveH(), reserveU(), sellNet, buyGross);
         if (dir != sellHype || max == 0) revert WrongDirection();
 
         uint64 lotWei = uint64(10 ** (8 - hypeSzDecimals)); // size step, in 1e8 units
@@ -266,15 +293,15 @@ contract HedgedPool {
         if (sellHype) {
             uint256 h = _min(_min(amount, max), coreH()) / 1e10; // 18 -> 8 decimals
             sz = uint64(h) / lotWei * lotWei;
-            limit = bid < pool ? pool : bid; // never sell below the pool price
+            limit = bid; // its net is above the pool price, or there is no max
         } else {
             uint256 spend = _min(_min(amount, max), coreU()) * 100; // USDC, 8 decimals
-            limit = ask > pool ? pool : ask; // never buy above the pool price
+            limit = ask; // its gross is below the pool price, or there is no max
             // HYPE (1e8 units) = USDC (1e8) / price (1e6) * 1e6
             sz = uint64(spend * 1e6 / limit) / lotWei * lotWei;
         }
         if (sz == 0 || uint256(sz) * p / 1e8 < MIN_NOTIONAL) revert TooSmall();
-        uint64 px = _toTick(limit * 100, sellHype); // 6 -> 8 decimals; round away from a loss
+        uint64 px = _toTick(limit * 100, sellHype); // 6 -> 8 decimals; a bid/ask is already a tick
         quietUntilTime = block.timestamp + ORDER_QUIET; // also blocks `toEvm` taking the order's input
         Core.limitOrder(uint32(10_000 + spotIndex), !sellHype, px, sz, false, Core.TIF_IOC, 0);
         emit Ordered(sellHype, px, sz);
@@ -297,8 +324,10 @@ contract HedgedPool {
         uint64 hSend = hypeWei < hFree ? hypeWei : hFree;
         uint64 uSend = (usdcWei < uFree ? usdcWei : uFree) / 100 * 100; // EVM USDC has 6 decimals
         if (hSend == 0 && uSend == 0) revert TooSmall();
-        if (msg.sender != keeper && uint256(hSend) * corePx() / 1e8 + uSend / 100 < MIN_NOTIONAL) {
-            revert TooSmall();
+        if (msg.sender != keeper) {
+            // HYPE valued at the checked bid: a one-sided or crossed book reverts (review r7)
+            (uint256 bid,) = hSend > 0 ? coreBbo() : (0, 0);
+            if (uint256(hSend) * bid / 1e8 + uSend / 100 < MIN_NOTIONAL) revert TooSmall();
         }
         _quiet();
         if (hSend > 0) {

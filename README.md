@@ -21,9 +21,9 @@ limit that remains (below). Reviews stop there.
 - **The limit HyperEVM sets.** That 30 s is a time assumption: nothing tells a contract when its
   Core order has run. It is accepted as a bounded risk (`docs/reviews/r6.md`); on testnet,
   orders ran within 1.5 s (`docs/step2-order-delay.md`).
-- **Rebalancing (keeper).** When the pool price drifts from the Core mid price, the keeper
-  bridges HYPE to Core and sells it with an IOC at the best bid, or buys HYPE with the USDC float
-  on Core at the best ask. Limits never cross the pool price. On testnet a sell took the pool
+- **Rebalancing (keeper).** When the price the pool would actually get on Core (the best bid
+  less fees, or the best ask plus fees) beats its own price, the keeper bridges HYPE to Core and
+  sells it with an IOC at the bid, or buys HYPE with the USDC float on Core at the ask. On testnet a sell took the pool
   price from 3.01 to 38.94 and a buy from 107.4 to 42.77, with Core at about 41.15.
 - **USDC only moves Core → EVM.** Sales fill the USDC float, buys spend it, and anyone can bring
   Core inventory to the EVM (USDC only above the keeper's floor). (USDC sent EVM → Core into a
@@ -41,7 +41,7 @@ Details: [docs/design.md](docs/design.md).
 | `docs/step1-bridging.md` | testnet: moving HYPE and USDC between the EVM and Core from a contract |
 | `docs/step2-order-delay.md` | testnet: how long a CoreWriter order takes to run (10 IOCs, all < 1.5 s) |
 | `docs/step3-pool-testnet.md` | testnet: the pool, sell and buy legs, Core → EVM, a swap, exit |
-| `docs/reviews/` | Codex review rounds: payloads, outputs, PoCs, and what was fixed (`r1.md`–`r6.md`) |
+| `docs/reviews/` | Codex review rounds: payloads, outputs, PoCs, and what was fixed (`r1.md`–`r7.md`) |
 | `script/lib.sh` | rate-limit-safe `cast` helpers for the public testnet RPC |
 | `script/measure_order_delay.sh` | send IOCs from a contract and time them against their EVM block |
 | `script/core_send.py` | send USDC on HyperCore, or print an address's Core state (`--state`) |
@@ -50,7 +50,7 @@ Details: [docs/design.md](docs/design.md).
 ```
 forge test
 ```
-30 tests: CoreWriter encodings, and the pool against a simulated Core (mocked precompiles and a
+33 tests: CoreWriter encodings, and the pool against a simulated Core (mocked precompiles and a
 recording CoreWriter).
 
 ## Things HyperEVM taught (measured on testnet)

@@ -61,15 +61,20 @@ need it.
 |---|---|---|
 | `add`, `remove`, `swapHypeForUsdc`, `swapUsdcForHype` | anyone | x·y=k with a 30 bp fee on `reserveH` / `reserveU`; wait out `quietUntil` |
 | `bridgeHype(amount)` | keeper | HYPE to the pool's Core account, to sell. Only when the pool is cheap, ≤ `maxRebalance`, ≥ 11 USDC, and only once the Core account exists (0x810; the keeper's `fundOps` creates it, so activation is the keeper's cost) |
-| `order(sellHype, amount)` | keeper | one IOC on the Core spot market, spending what is on Core. Direction rechecked on live reserves against the Core mid (0x80e best bid/ask); size ≤ `maxRebalance`; limit at the best bid (sell) or ask (buy) but never worse than the pool price, rounded to the tick away from a loss; refused if the book is wider than 5%; then `ORDER_QUIET` |
-| `toEvm(hypeWei, usdcWei)` | anyone | Core → EVM. Others must move ≥ 11 USDC worth and cannot take USDC below `effectiveFloor()`: the keeper's `floatFloor`, capped at 10% of all the pool's USDC so payouts never depend on the keeper alone |
+| `order(sellHype, amount)` | keeper | one IOC on the Core spot market, spending what is on Core, only when the price it would actually get beats the pool price: the bid less a 10 bp fee (sell) or the ask plus 10 bp (buy). Size ≤ `maxRebalance`; limit at the bid/ask; then `ORDER_QUIET` |
+| `toEvm(hypeWei, usdcWei)` | anyone | Core → EVM. Others must move ≥ 11 USDC worth (HYPE at the checked bid) and cannot take USDC below `effectiveFloor()`: the keeper's `floatFloor`, capped at 10% of all the pool's USDC so payouts never depend on the keeper alone |
 | `fundOps()`, `setFloatFloor()` | keeper | ops float (Core HYPE for gas, not in reserves); the USDC floor |
 | first `add` | keeper | anything already in the pool would otherwise go to whoever mints first |
 
-`maxRebalance`: the amount that moves `reserveU / reserveH` to the Core mid, never past it. The
-last trade price (0x808) is not used: on testnet it sat at the ask of a 2% book and a limit set
-off it never filled (docs/step3-pool-testnet.md).
-A sell: `dh = (p·h − u) / 2p`. A buy: `du = (u − p·h) / 2`.
+`maxRebalance`: the amount that moves `reserveU / reserveH` to the executable price (bid less
+fee, or ask plus fee), never past it; nothing when neither beats the pool price (review r7:
+sizing on the mid lost the half-spread and fees). With `p` that price, a sell is
+`dh = (p·h − u) / 2p` and a buy `du = (u − p·h) / 2`.
+
+Core prices come from the best bid/ask precompile (0x80e, asset id 10000 + spot index), checked
+in one place: both sides present, not crossed, at most 5% wide. The last trade price (0x808) is
+not used: on testnet it sat at the ask of a 2% book and a limit set off it never filled
+(docs/step3-pool-testnet.md).
 
 ## Facts this rests on (measured on testnet)
 - CoreWriter writes run after the EVM block. Spot IOCs filled 347–477 ms after the block
@@ -85,8 +90,9 @@ A sell: `dh = (p·h − u) / 2p`. A buy: `du = (u − p·h) / 2`.
 Codex, adversarial, with PoCs (docs/reviews/): r1 5 findings, r2 2, r3 2, r4 3, r5 4, r6 4.
 After r5 the pool was rebuilt on balances only (above). r6's main finding (trading around a
 pending order) cannot be closed without a settlement signal from Core; it is covered by the
-30 s pause and accepted as a bounded risk. Reviews stop here. After r6 the pricing moved from
-the last trade to the best bid/ask (not reviewed), and the pool ran on testnet both ways.
+30 s pause and accepted as a bounded risk. After r6 the pricing moved from the last trade to the
+best bid/ask and the pool ran on testnet both ways; r7 reviewed that change only (2 findings,
+fixed: fee-aware executable prices, quote checks).
 
 ## Open
 - `ORDER_QUIET` (30 s) is a time assumption. Testnet fills took < 1.5 s (n = 10); measure again

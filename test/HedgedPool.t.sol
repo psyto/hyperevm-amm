@@ -257,18 +257,18 @@ contract HedgedPoolTest is Test {
     // ------------------------------------------------------------ rebalance
 
     function test_maxRebalanceDirection() public {
-        _setCorePx(42_000_000); // Core 42 > pool 40: pool is cheap, sell HYPE on Core
+        _setCorePx(42_000_000); // bid 42 after the 10 bp fee 41.958 > pool 40: sell HYPE on Core
         (bool sell, uint256 a) = pool.maxRebalance();
         assertTrue(sell);
-        // dh = (42·100 − 4000) / 84 = 2.381 HYPE
-        assertApproxEqAbs(a, 2.381 ether, 0.001 ether);
+        // dh = (41.958·100 − 4000) / (2·41.958) = 2.333 HYPE
+        assertApproxEqAbs(a, 2.333 ether, 0.001 ether);
 
-        _setCorePx(38_000_000); // Core 38 < pool 40: buy HYPE on Core
+        _setCorePx(38_000_000); // ask 38 after the fee 38.038 < pool 40: buy HYPE on Core
         (sell, a) = pool.maxRebalance();
         assertFalse(sell);
-        assertEq(a, 100e6); // (4000 − 3800) / 2
+        assertEq(a, 98.1e6); // (4000 − 3803.8) / 2
 
-        _setCorePx(40_000_000);
+        _setCorePx(40_000_000); // 39.96 / 40.04 around 40: nothing pays
         (, a) = pool.maxRebalance();
         assertEq(a, 0);
     }
@@ -314,7 +314,7 @@ contract HedgedPoolTest is Test {
         assertEq(pool.reserveH(), 100 ether);
         vm.prank(keeper);
         pool.order(true, 2 ether);
-        // sells 2.00 (under the 2.381 cap) at the best bid
+        // sells 2.00 (under the 2.333 cap) at the best bid
         assertEq(writer.sent(0), _order(false, 42e8, 2e8));
 
         // filled whenever: 2 HYPE on Core became 82.30 USDC on Core; both are counted
@@ -349,18 +349,17 @@ contract HedgedPoolTest is Test {
         assertEq(writer.sent(0), _order(false, 40.3e8, 0.3e8), "at the bid");
 
         skip(pool.ORDER_QUIET());
-        _setBbo(39_818_000, 40_620_000); // bid below the pool price
+        _setBbo(39_900_000, 40_620_000); // bid above the pool price, but not after the fee
         vm.prank(keeper);
+        vm.expectRevert(HedgedPool.WrongDirection.selector);
         pool.order(true, 0.3 ether);
-        // lifted to the pool price, 5 significant figures rounded up: 39.881
-        assertEq(writer.sent(1), _order(false, 39.881e8, 0.3e8));
     }
 
     function test_wideBookRefused() public {
         _setCoreBal(HYPE, 1e6 + 2e8);
-        _setBbo(40_000_000, 44_000_000); // 9.5% wide
+        _setBbo(40_000_000, 44_000_000); // 9.52% wide, rounded up
         vm.prank(keeper);
-        vm.expectRevert(abi.encodeWithSelector(HedgedPool.WideBook.selector, 952));
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.WideBook.selector, 953));
         pool.order(true, 2 ether);
     }
 
@@ -398,13 +397,13 @@ contract HedgedPoolTest is Test {
         assertEq(writer.sent(0), _order(true, 38e8, 0.52e8));
     }
 
-    function test_buyLimitNeverAbovePool() public {
+    /// r7: the mid says buy, but the ask is above the pool price: no trade.
+    function test_buyNeedsAskBelowPool() public {
         _setCoreBal(Core.USDC, 400e8); // pool 4400 / 100 = 44.00
-        _setBbo(42_600_000, 44_200_000); // mid 43.4, ask above the pool price
+        _setBbo(42_600_000, 44_200_000); // mid 43.4 < 44, ask 44.2 > 44
         vm.prank(keeper);
-        pool.order(false, 30e6); // du = (4400 − 4340) / 2 = 30
-        // capped at the pool price 44.00; 30 / 44 = 0.6818 -> 0.68
-        assertEq(writer.sent(0), _order(true, 44e8, 0.68e8));
+        vm.expectRevert(HedgedPool.WrongDirection.selector);
+        pool.order(false, 30e6);
     }
 
     function test_dustOrderRefused() public {
@@ -463,5 +462,44 @@ contract HedgedPoolTest is Test {
         vm.prank(trader);
         pool.toEvm(0, 1_000e8);
         assertEq(writer.sent(0), _send(USDC_SYS, 0, 500e8));
+    }
+
+    // ------------------------------------------------------------ review r7
+
+    /// r7 medium: a 40/42 book with the pool at 40. The mid (41) says sell, but selling at the bid
+    /// after fees would lose to LPs, so nothing happens.
+    function test_r7_midDoesNotAuthorizeALosingSale() public {
+        _setCoreBal(HYPE, 1e6 + 1e8); // 1 HYPE on Core to sell
+        _setCoreBal(Core.USDC, 40e8); // keeps the pool at 4040 / 101 = 40.00
+        _setBbo(40_000_000, 42_000_000);
+        assertEq(pool.poolPx(), 40_000_000);
+        (, uint256 a) = pool.maxRebalance();
+        assertEq(a, 0);
+        vm.prank(keeper);
+        vm.expectRevert(HedgedPool.WrongDirection.selector);
+        pool.order(true, 1 ether);
+    }
+
+    /// r7 medium: malformed quotes are rejected, not trusted or panicked on.
+    function test_r7_badQuotesRejected() public {
+        _setBbo(0, 42_000_000);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.BadQuote.selector, 0, 42_000_000));
+        pool.corePx();
+        _setBbo(42_000_000, 41_000_000); // crossed
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.BadQuote.selector, 42_000_000, 41_000_000));
+        pool.maxRebalance();
+    }
+
+    /// r7 medium: a spoofed one-sided book cannot make a dust `toEvm` look worth 11 USDC.
+    function test_r7_toEvmValuesHypeAtCheckedBid() public {
+        _setCoreBal(HYPE, 1e6 + 10e8);
+        _setBbo(0, 1_000_000_000_000);
+        vm.prank(trader);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.BadQuote.selector, 0, 1_000_000_000_000));
+        pool.toEvm(1, 0);
+        _setCorePx(40_000_000);
+        vm.prank(trader);
+        vm.expectRevert(HedgedPool.TooSmall.selector);
+        pool.toEvm(1, 0);
     }
 }
