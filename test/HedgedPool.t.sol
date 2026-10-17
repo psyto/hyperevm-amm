@@ -55,6 +55,7 @@ contract HedgedPoolTest is Test {
         _setCoreBal(HYPE, 1e6);
         _setCoreBal(Core.USDC, 0);
         _setCorePx(40_000_000);
+        _setCoreUser(true);
 
         // 100 HYPE + 4,000 USDC: pool price 40.00. The keeper seeds the first 1%.
         vm.deal(keeper, 1 ether);
@@ -85,6 +86,10 @@ contract HedgedPoolTest is Test {
         vm.mockCall(
             Core.SPOT_BALANCE, abi.encode(address(pool), token), abi.encode(Core.SpotBalance(wei8, 0, 0))
         );
+    }
+
+    function _setCoreUser(bool exists) internal {
+        vm.mockCall(Core.CORE_USER_EXISTS, abi.encode(address(pool)), abi.encode(exists));
     }
 
     function _order(bool isBuy, uint64 px8, uint64 sz) internal pure returns (bytes memory) {
@@ -281,10 +286,10 @@ contract HedgedPoolTest is Test {
         vm.expectRevert(HedgedPool.NotKeeper.selector);
         pool.bridgeHype(1 ether);
 
-        // r4: no rebalance before the keeper has funded the Core account
-        _setCoreBal(HYPE, 0);
+        // r4: no rebalance before the keeper has created the Core account
+        _setCoreUser(false);
         vm.prank(keeper);
-        vm.expectRevert(HedgedPool.NoOpsFloat.selector);
+        vm.expectRevert(HedgedPool.NoCoreAccount.selector);
         pool.bridgeHype(1 ether);
     }
 
@@ -338,6 +343,7 @@ contract HedgedPoolTest is Test {
         pool.order(true, 0.3 ether);
         assertEq(writer.sent(0), _order(false, 39.897e8, 0.3e8));
 
+        skip(pool.ORDER_QUIET());
         _setCoreBal(HYPE, 1e6 + 0.3e8);
         _setCorePx(40_000_000 + 220_000); // Core 40.22 − 1% = 39.818 < pool 39.88
         vm.prank(keeper);
@@ -359,7 +365,8 @@ contract HedgedPoolTest is Test {
         _setCoreBal(Core.USDC, 100.2e8);
         assertEq(pool.reserveH(), 102.6 ether);
 
-        // anyone brings the HYPE over
+        // anyone brings the HYPE over, once the order quiet has passed
+        skip(pool.ORDER_QUIET());
         vm.prank(trader);
         pool.toEvm(2.6e8, 0);
         assertEq(writer.sent(1), _send(Core.HYPE_SYSTEM, HYPE, 2.6e8));
@@ -402,5 +409,55 @@ contract HedgedPoolTest is Test {
         vm.prank(keeper);
         vm.expectRevert(HedgedPool.TooSmall.selector);
         pool.order(true, 0.1 ether); // 4.2 USDC
+    }
+
+    // ------------------------------------------------------------ review r6
+
+    /// r6 high: nobody can trade the AMM around a pending order (the sandwich).
+    function test_r6_orderQuietBlocksSandwich() public {
+        _setCoreBal(HYPE, 1e6 + 2e8);
+        _setCorePx(42_000_000);
+        vm.prank(keeper);
+        pool.order(true, 2 ether);
+        vm.startPrank(trader);
+        vm.expectRevert(HedgedPool.Busy.selector);
+        pool.swapUsdcForHype(200e6, 0);
+        skip(pool.ORDER_QUIET() - 1);
+        vm.expectRevert(HedgedPool.Busy.selector);
+        pool.swapUsdcForHype(200e6, 0);
+        skip(1);
+        pool.swapUsdcForHype(200e6, 0);
+        vm.stopPrank();
+    }
+
+    /// r6 medium: nobody can pull a pending sell's HYPE off Core to make it fail.
+    function test_r6_orderQuietBlocksCensoring() public {
+        _setCoreBal(HYPE, 1e6 + 2e8);
+        _setCorePx(42_000_000);
+        vm.prank(keeper);
+        pool.order(true, 2 ether);
+        vm.prank(trader);
+        vm.expectRevert(HedgedPool.Busy.selector);
+        pool.toEvm(2e8, 0);
+    }
+
+    /// r6 medium: gas spent on anyone's `toEvm` cannot block bridging: the gate is the account.
+    function test_r6_bridgeNeedsAccountNotThreshold() public {
+        _setCoreBal(HYPE, 1); // ops float worn down to dust
+        _setCorePx(42_000_000);
+        vm.prank(keeper);
+        pool.bridgeHype(2 ether);
+        assertEq(Core.HYPE_SYSTEM.balance, 2 ether);
+    }
+
+    /// r6 medium: the keeper's floor is capped, so payouts never depend on the keeper alone.
+    function test_r6_floorCapped() public {
+        _setCoreBal(Core.USDC, 1_000e8); // all USDC: 5,000; cap 10% = 500
+        vm.prank(keeper);
+        pool.setFloatFloor(1_000e8); // tries to protect all of it
+        assertEq(pool.effectiveFloor(), 500e8);
+        vm.prank(trader);
+        pool.toEvm(0, 1_000e8);
+        assertEq(writer.sent(0), _send(USDC_SYS, 0, 500e8));
     }
 }

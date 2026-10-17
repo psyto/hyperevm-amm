@@ -12,10 +12,14 @@ import {Core, IERC20} from "./Core.sol";
 /// only changes balances that are already counted, so there is nothing to reconcile (review
 /// rounds 1-5 all came from keeping books the EVM cannot check, docs/reviews/r5.md).
 ///
-/// The one thing balances miss is a transfer between the EVM and Core while it is moving. By
-/// Hyperliquid's documented ordering, EVM -> Core transfers are processed right after the EVM
-/// block that sent them, and Core -> EVM transfers are credited in the next HyperEVM block. So
-/// after any such transfer, swaps and liquidity wait `QUIET_BLOCKS` blocks.
+/// Two things balances cannot show, and the pool pauses swaps and liquidity for both:
+/// - A transfer between the EVM and Core while it moves. By Hyperliquid's documented ordering,
+///   EVM -> Core transfers are processed right after the EVM block that sent them and Core -> EVM
+///   transfers are credited in the next HyperEVM block: `QUIET_BLOCKS` after any transfer.
+/// - A Core order that has been sent but not yet run (CoreWriter delays orders "a few seconds").
+///   Trading the AMM meanwhile would let someone move the pool price around the order and keep
+///   the difference (review r6). `ORDER_QUIET` after any order. This one is a time assumption,
+///   with no documented bound; if an order ever ran later, the loss is bounded by that order.
 ///
 /// USDC only moves Core -> EVM (EVM -> Core into a contract's Core account did not credit on
 /// testnet, docs/step1-bridging.md): HYPE is bought on Core with the USDC float, and sales add
@@ -26,6 +30,8 @@ contract HedgedPool {
     uint256 public constant SLIPPAGE_BPS = 100; // IOC limit vs Core spot price
     uint256 public constant MIN_NOTIONAL = 11e6; // USDC; Core spot rejects orders under 10 USDC
     uint256 public constant QUIET_BLOCKS = 2; // one block for the documented ordering, one spare
+    uint256 public constant ORDER_QUIET = 30; // seconds; ~10x the measured fill delay (<= 4 s)
+    uint256 public constant MAX_FLOOR_BPS = 1_000; // the protected USDC float is at most 10% of all USDC
     /// HYPE kept on the pool's Core account to pay for Core -> EVM sends. Funded by the keeper
     /// through `fundOps`; not part of the reserves.
     uint64 public constant KEEP_HYPE_WEI = 1e6; // 0.01 HYPE
@@ -41,6 +47,7 @@ contract HedgedPool {
     mapping(address => uint256) public shares;
 
     uint256 public quietUntil; // swaps and liquidity wait while block.number <= quietUntil
+    uint256 public quietUntilTime; // ... and while block.timestamp < quietUntilTime (after an order)
     uint64 public floatFloor; // Core USDC (8 decimals) only the keeper may move to the EVM
 
     event Swap(address indexed who, bool hypeIn, uint256 amountIn, uint256 amountOut);
@@ -57,7 +64,7 @@ contract HedgedPool {
     error TooSmall();
     error NotEnoughEvmUsdc(uint256 have);
     error NotEnoughEvmHype(uint256 have);
-    error NoOpsFloat();
+    error NoCoreAccount();
 
     constructor(IERC20 usdc_, address keeper_, uint64 hypeToken_, uint64 spotIndex_, uint8 hypeSzDecimals_) {
         usdc = usdc_;
@@ -68,7 +75,7 @@ contract HedgedPool {
     }
 
     modifier settled() {
-        if (block.number <= quietUntil) revert Busy();
+        if (block.number <= quietUntil || block.timestamp < quietUntilTime) revert Busy();
         _;
     }
 
@@ -202,6 +209,13 @@ contract HedgedPool {
         floatFloor = wei8;
     }
 
+    /// The protected float in effect: the keeper's `floatFloor`, capped at `MAX_FLOOR_BPS` of all
+    /// the pool's USDC so payouts never depend on the keeper alone (review r6). Core 8 decimals.
+    function effectiveFloor() public view returns (uint64) {
+        uint256 cap = reserveU() * MAX_FLOOR_BPS / 10_000 * 100;
+        return floatFloor < cap ? floatFloor : uint64(cap);
+    }
+
     /// Move `amount` HYPE (18 decimals) to the pool's Core account, to sell there. Only when the
     /// pool is cheap, and no more than `maxRebalance`.
     function bridgeHype(uint256 amount) external onlyKeeper settled {
@@ -210,9 +224,10 @@ contract HedgedPool {
         if (!sell) revert WrongDirection();
         if (amount > max) revert TooMuch(max);
         if (amount * p / 1e18 < MIN_NOTIONAL) revert TooSmall();
-        // the Core account must exist and hold the keeper's float, so activation is not paid
-        // out of LP HYPE (review r4)
-        if (Core.spotBalance(address(this), hypeToken).total < KEEP_HYPE_WEI) revert NoOpsFloat();
+        // the Core account must already exist (the keeper's `fundOps` creates it), so activation
+        // is not paid out of LP HYPE (review r4). Not a balance threshold: gas for anyone's
+        // `toEvm` would wear it down and block bridging (review r6).
+        if (!Core.userExists(address(this))) revert NoCoreAccount();
         _quiet();
         (bool ok,) = Core.HYPE_SYSTEM.call{value: amount}("");
         require(ok);
@@ -247,6 +262,7 @@ contract HedgedPool {
         }
         if (sz == 0 || uint256(sz) * p / 1e8 < MIN_NOTIONAL) revert TooSmall();
         uint64 px = _toTick(limit * 100, sellHype); // 6 -> 8 decimals; round away from a loss
+        quietUntilTime = block.timestamp + ORDER_QUIET; // also blocks `toEvm` taking the order's input
         Core.limitOrder(uint32(10_000 + spotIndex), !sellHype, px, sz, false, Core.TIF_IOC, 0);
         emit Ordered(sellHype, px, sz);
     }
@@ -255,7 +271,7 @@ contract HedgedPool {
 
     /// Bring Core inventory to the EVM: up to `hypeWei` of HYPE above the ops float and up to
     /// `usdcWei` of USDC (Core 8 decimals). Anyone may call it, so payouts can always be unblocked;
-    /// only the keeper may take USDC below `floatFloor`, the float buys need (review r5). A send
+    /// only the keeper may take USDC below `effectiveFloor()`, the float buys need (review r5). A send
     /// Core rejects (e.g. a pending order spent the balance first) leaves the tokens on Core,
     /// still counted. Others must move at least `MIN_NOTIONAL`, which prices out pausing the
     /// pool for free.
@@ -263,7 +279,8 @@ contract HedgedPool {
         uint64 h = Core.spotBalance(address(this), hypeToken).total;
         uint64 u = Core.spotBalance(address(this), Core.USDC).total;
         uint64 hFree = h > KEEP_HYPE_WEI ? h - KEEP_HYPE_WEI : 0;
-        uint64 uFree = msg.sender == keeper ? u : (u > floatFloor ? u - floatFloor : 0);
+        uint64 floor = effectiveFloor();
+        uint64 uFree = msg.sender == keeper ? u : (u > floor ? u - floor : 0);
         uint64 hSend = hypeWei < hFree ? hypeWei : hFree;
         uint64 uSend = (usdcWei < uFree ? usdcWei : uFree) / 100 * 100; // EVM USDC has 6 decimals
         if (hSend == 0 && uSend == 0) revert TooSmall();
