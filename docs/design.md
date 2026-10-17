@@ -13,6 +13,15 @@ market itself: HyperCore spot `@1035` on testnet (`@107` HYPE/USDC on mainnet) t
 - LP shares, proportional mint/burn.
 - A rebalance state: `Idle → OnCore → Ordered → Returning → Idle`.
 
+## Invariant (after review r1)
+What leaves the EVM reserves for Core stays owed until it is seen back in the EVM balances.
+`sendBack` fixes `expectH`/`expectU` once; retries resend what is still on Core and never lower
+them. Ways out of every stage: `order` reverts if the price has turned (then `sendBack` returns
+the tokens untraded); `sendBack` from `OnCore` once the bridge has arrived, or after
+`STUCK_DELAY` (a bridge that never arrives becomes a recognised loss, not a frozen pool).
+Rebalances under 11 USDC are refused. The Core HYPE float is keeper-funded (`fundOps`). The buy
+leg is off when the pool is deployed with no deposit wallet (testnet).
+
 ## Swaps
 x·y=k with a fee, `minOut`, against `rH`/`rU`. Swaps, adds and removes are **paused while a
 rebalance is in flight**: the reserves are then partly on Core and the pool cannot price them

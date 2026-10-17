@@ -1,0 +1,221 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {Core, IERC20} from "../../src/Core.sol";
+import {HedgedPool} from "../../src/HedgedPool.sol";
+
+/// Minimal exact-transfer token, sufficient to model the pool's USDC accounting.
+contract PoCUsdc {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+/// Models the measured testnet failure: EVM USDC is pulled, but no Core credit materializes.
+contract BlackHoleDepositWallet {
+    PoCUsdc immutable token;
+
+    constructor(PoCUsdc token_) {
+        token = token_;
+    }
+
+    function deposit(uint256 amount, uint32) external {
+        token.transferFrom(msg.sender, address(this), amount);
+    }
+}
+
+/// Records CoreWriter calls without attempting to execute them.
+contract PoCWriter {
+    bytes[] internal actions;
+
+    function sendRawAction(bytes calldata data) external {
+        actions.push(data);
+    }
+
+    function sent(uint256 i) external view returns (bytes memory) {
+        return actions[i];
+    }
+}
+
+contract HedgedPoolStateMachinePoC is Test {
+    uint64 internal constant HYPE = 1105;
+    uint64 internal constant SPOT = 1035;
+    address internal constant KEEPER = address(0xC0FFEE);
+    address internal constant LP = address(0xBEEF);
+
+    PoCUsdc internal usdc;
+    HedgedPool internal pool;
+
+    function setUp() public {
+        vm.etch(address(Core.WRITER), address(new PoCWriter()).code);
+        usdc = new PoCUsdc();
+        pool = new HedgedPool(
+            IERC20(address(usdc)), address(new BlackHoleDepositWallet(usdc)), KEEPER, HYPE, SPOT, 2
+        );
+        vm.deal(LP, 100 ether);
+        usdc.mint(LP, 10_000e6);
+        vm.startPrank(LP);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 100 ether}(4_000e6, 0);
+        vm.stopPrank();
+    }
+
+    function _corePx(uint64 px6) internal {
+        vm.mockCall(Core.SPOT_PX, abi.encode(SPOT), abi.encode(px6));
+    }
+
+    function _coreBalance(uint64 token, uint64 amount8) internal {
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(pool), token), abi.encode(Core.SpotBalance(amount8, 0, 0))
+        );
+    }
+
+    /// A real documented bridge failure burns the pool's USDC into the deposit wallet and has no
+    /// recovery transition: order() cannot be entered, while all LP operations remain paused.
+    function test_PoC_buyRebalanceBridgeFailurePermanentlyFreezesAndStrandsUsdc() public {
+        _corePx(38_000_000); // pool 40 > Core 38, hence start the buy-HYPE leg
+        vm.prank(KEEPER);
+        pool.start(false, 100e6);
+
+        assertEq(pool.rU(), 3_900e6, "accounting already removed USDC");
+        assertEq(usdc.balanceOf(address(pool)), 3_900e6, "USDC left the pool");
+        assertEq(usdc.balanceOf(pool.depositWallet()), 100e6, "deposit wallet has it");
+
+        // No Core credit (the behavior recorded in docs/step1-bridging.md).
+        _coreBalance(Core.USDC, 0);
+        vm.prank(KEEPER);
+        vm.expectRevert(HedgedPool.NotYet.selector);
+        pool.order();
+
+        assertEq(uint8(pool.stage()), uint8(HedgedPool.Stage.OnCore));
+        uint256 lpShares = pool.shares(LP);
+        vm.prank(LP);
+        vm.expectRevert(HedgedPool.Busy.selector);
+        pool.remove(lpShares, 0, 0);
+    }
+
+    /// start accepts a dust HYPE amount.  It can never satisfy order's > KEEP_HYPE_WEI gate,
+    /// so even a 1-wei keeper input pauses every LP operation forever.
+    function test_PoC_dustHypeStartPermanentlyFreezesPool() public {
+        _corePx(42_000_000);
+        vm.prank(KEEPER);
+        pool.start(true, 1);
+
+        _coreBalance(HYPE, 1);
+        vm.prank(KEEPER);
+        vm.expectRevert(HedgedPool.NotYet.selector);
+        pool.order();
+
+        assertEq(uint8(pool.stage()), uint8(HedgedPool.Stage.OnCore));
+        uint256 lpShares = pool.shares(LP);
+        vm.prank(LP);
+        vm.expectRevert(HedgedPool.Busy.selector);
+        pool.remove(lpShares, 0, 0);
+    }
+
+    /// The price can reverse after start.  The pool then sells HYPE at 29.7 even though its
+    /// post-start EVM price is 40.816..., which is the opposite of the required trade direction.
+    function test_PoC_priceReversalExecutesWrongWayLossMakingOrder() public {
+        _corePx(42_000_000);
+        vm.prank(KEEPER);
+        pool.start(true, 2 ether);
+
+        _corePx(30_000_000);
+        _coreBalance(HYPE, 2e8);
+        vm.prank(KEEPER);
+        pool.order();
+
+        assertGt(pool.poolPx(), pool.corePx(), "at order time the pool is dear and should buy HYPE");
+        bytes memory action = PoCWriter(address(Core.WRITER)).sent(0);
+        assertEq(
+            action,
+            abi.encodePacked(
+                hex"01000001",
+                abi.encode(uint32(11_035), false, uint64(29.7e8), uint64(1.99e8), false, uint8(3), uint128(0))
+            ),
+            "stale direction still sells HYPE at a limit far below the pool price"
+        );
+    }
+
+    /// Re-entering sendBack after the Core debit but before an asynchronous EVM credit resets
+    /// expectations to the depleted reserves. finish() then succeeds and later credits are
+    /// permanently excluded from rH/rU.
+    function test_PoC_secondSendBackCanWriteOffPendingCoreToEvmCredit() public {
+        _corePx(42_000_000);
+        vm.prank(KEEPER);
+        pool.start(true, 2 ether);
+        _coreBalance(HYPE, 2e8);
+        vm.prank(KEEPER);
+        pool.order();
+
+        skip(10);
+        _coreBalance(HYPE, pool.KEEP_HYPE_WEI());
+        _coreBalance(Core.USDC, 80e8);
+        vm.prank(KEEPER);
+        pool.sendBack();
+        assertEq(pool.expectU(), 4_080e6);
+
+        // First Core send was accepted, yet its EVM credit is still pending.
+        _coreBalance(HYPE, pool.KEEP_HYPE_WEI());
+        _coreBalance(Core.USDC, 0);
+        vm.prank(KEEPER);
+        pool.sendBack();
+        assertEq(pool.expectU(), 4_000e6, "second call erased the pending-credit expectation");
+
+        vm.prank(KEEPER);
+        pool.finish();
+        assertEq(pool.rU(), 4_000e6, "finish accepts before the first credit arrives");
+
+        usdc.mint(address(pool), 80e6); // delayed Core -> EVM credit
+        assertEq(usdc.balanceOf(address(pool)), 4_080e6);
+        assertEq(pool.rU(), 4_000e6, "80 USDC is now unaccounted and cannot be reclaimed");
+    }
+
+    /// The mandatory Core HYPE float is a real 0.01-HYPE pool asset, but finish() only values
+    /// EVM balances.  At exactly KEEP_HYPE_WEI, every sendBack() necessarily sends zero HYPE.
+    function test_PoC_coreHypeFloatIsPermanentlyExcludedFromLpReserves() public {
+        _corePx(42_000_000);
+        vm.prank(KEEPER);
+        pool.start(true, 2 ether);
+        _coreBalance(HYPE, 2e8);
+        vm.prank(KEEPER);
+        pool.order();
+
+        skip(10);
+        _coreBalance(HYPE, pool.KEEP_HYPE_WEI());
+        _coreBalance(Core.USDC, 80e8);
+        vm.prank(KEEPER);
+        pool.sendBack();
+        usdc.mint(address(pool), 80e6);
+        vm.prank(KEEPER);
+        pool.finish();
+
+        assertEq(pool.rH(), 98 ether);
+        assertEq(address(pool).balance, 98 ether);
+        assertEq(uint256(pool.KEEP_HYPE_WEI()) * 1e10, 0.01 ether, "Core-only pool HYPE");
+        // With h == KEEP_HYPE_WEI, sendBack's hSend is always zero, so this LP asset can never
+        // enter rH and is absent from every add/remove/share calculation.
+    }
+}

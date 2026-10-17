@@ -1,0 +1,17 @@
+Findings (PoCs added in [HedgedPoolStateMachine.poc.t.sol](test/poc/HedgedPoolStateMachine.poc.t.sol:97)):
+
+- **High — buy-leg USDC is stranded and permanently freezes LPs.** `test_PoC_buyRebalanceBridgeFailurePermanentlyFreezesAndStrandsUsdc` passes: `start(false, 100e6)` transfers 100 USDC out, Core shows zero, `order()` cannot proceed, and all LP operations remain paused. This is the exact measured contract-Core deposit failure in `docs/step1-bridging.md`. Root cause: accounting and state advance before a Core credit exists, with no `OnCore` recovery path. Fix: disable the USDC deposit leg until proven, or use a pre-funded Core float; add a reconciled abort/recovery path.
+
+- **High — a price reversal trades in the wrong direction at a loss.** `test_PoC_priceReversalExecutesWrongWayLossMakingOrder` passes: after starting a sell at Core price 42, a move to 30 causes an IOC HYPE sale at 29.7 even though the pool is then dear (40.816). Root cause: `start()` fixes the direction using a stale price, while `order()` refreshes only the limit price. Fix: persist the start-price/adjusted reserve snapshot; before ordering, require the current price still supports that direction and otherwise return the bridged funds.
+
+- **Medium — retrying `sendBack()` can write off a pending Core→EVM credit.** `test_PoC_secondSendBackCanWriteOffPendingCoreToEvmCredit` passes: the first call expects 80 USDC, a retry after the Core debit observes zero and lowers `expectU`, then `finish()` accepts before the queued credit lands; the 80 USDC becomes unaccounted. Core→EVM transfers are queued until the next HyperEVM block, while CoreWriter actions are processed after the EVM block, so this needs explicit pending-withdrawal accounting. [Hyperliquid interaction timings](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/interaction-timings) Fix: retain cumulative expectations across retries; never reduce pending credits until observed on EVM.
+
+- **Medium — dust HYPE start permanently pauses the pool.** `test_PoC_dustHypeStartPermanentlyFreezesPool` passes: `start(true, 1)` is accepted but cannot exceed `KEEP_HYPE_WEI`, so `order()` always reverts and LP withdrawals remain blocked. Activation fees make this worse for first use: new Core accounts incur a one-quote-token fee. [Activation-gas documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/activation-gas-fee) Fix: enforce a nonzero, Core-lot-aligned minimum sufficient to exceed the retained float and activation cost; add an `OnCore` abort/recovery transition.
+
+- **Low — the 0.01 HYPE Core float is excluded from LP NAV forever.** `test_PoC_coreHypeFloatIsPermanentlyExcludedFromLpReserves` passes: after a rebalance, 0.01 HYPE remains on Core yet is absent from `rH`, add/remove math, and LP valuation; `sendBack()` cannot send it. Fix: fund it separately as a protocol operational balance, or include Core assets in explicit NAV/accounting and provide a shutdown recovery route.
+
+The unit conversions and CoreWriter encoding themselves matched Hyperliquid’s documented spot-price scaling and order fields; CoreWriter orders are nonetheless delayed, which is why the state-machine checks above must be robust to changing prices and asynchronous settlement. [Hyperliquid CoreWriter documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/interacting-with-hypercore)
+
+Test results: PoC suite **5 passed, 0 failed**; full suite **18 passed, 0 failed**. PoCs pass by asserting the vulnerable behavior.
+
+VERDICT: CHANGES

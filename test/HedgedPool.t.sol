@@ -77,6 +77,10 @@ contract HedgedPoolTest is Test {
         pool.add{value: 100 ether}(4_000e6, 0);
         vm.stopPrank();
 
+        // the pool's Core account holds only the keeper-funded ops float
+        _setCoreBal(HYPE, pool.KEEP_HYPE_WEI());
+        _setCoreBal(Core.USDC, 0);
+
         vm.deal(trader, 1000 ether);
         usdc.mint(trader, 1_000_000e6);
         vm.prank(trader);
@@ -163,22 +167,21 @@ contract HedgedPoolTest is Test {
         vm.expectRevert(HedgedPool.Busy.selector);
         pool.swapHypeForUsdc{value: 1 ether}(0);
 
-        // nothing on Core yet
-        _setCoreBal(HYPE, 0);
+        // nothing on Core yet: only the ops float
         vm.prank(keeper);
         vm.expectRevert(HedgedPool.NotYet.selector);
         pool.order();
 
-        // 2 HYPE arrived, minus a 1 USDC activation fee taken in HYPE (0.0238)
-        _setCoreBal(HYPE, 197_619_048);
+        // 2 HYPE arrived on top of the float
+        _setCoreBal(HYPE, 1e6 + 2e8);
         vm.prank(keeper);
         pool.order();
-        // sells (1.97619048 − 0.01) rounded to the 0.01 lot = 1.96; limit 42 × 0.99 = 41.58
+        // sells 2.00 (under the 2.381 cap); limit 42 × 0.99 = 41.58
         assertEq(
             writer.sent(0),
             abi.encodePacked(
                 hex"01000001",
-                abi.encode(uint32(11035), false, uint64(41.58e8), uint64(1.96e8), false, uint8(3), uint128(0))
+                abi.encode(uint32(11035), false, uint64(41.58e8), uint64(2e8), false, uint8(3), uint128(0))
             )
         );
 
@@ -186,21 +189,15 @@ contract HedgedPoolTest is Test {
         vm.expectRevert(HedgedPool.NotYet.selector);
         pool.sendBack();
 
-        // filled at 42 less fees: 82.30 USDC; HYPE left 0.01619048
+        // filled at ~41.2 less fees: 82.30 USDC; the float is all the HYPE left
         skip(10);
-        _setCoreBal(HYPE, 1_619_048);
+        _setCoreBal(HYPE, 1e6);
         _setCoreBal(Core.USDC, 8_230_123_456);
         vm.prank(keeper);
         pool.sendBack();
+        assertEq(writer.count(), 2, "no HYPE send: only the float is left");
         assertEq(
             writer.sent(1),
-            abi.encodePacked(
-                hex"0100000d",
-                abi.encode(Core.HYPE_SYSTEM, address(0), type(uint32).max, type(uint32).max, HYPE, uint64(619_048))
-            )
-        );
-        assertEq(
-            writer.sent(2),
             abi.encodePacked(
                 hex"0100000d",
                 abi.encode(
@@ -220,13 +217,12 @@ contract HedgedPoolTest is Test {
         pool.finish();
 
         // Core -> EVM: balance appears without a call
-        vm.deal(address(pool), address(pool).balance + 619_048 * 1e10);
         usdc.mint(address(pool), 82_301_234);
         vm.prank(keeper);
         pool.finish();
 
         assertEq(uint8(pool.stage()), 0);
-        assertEq(pool.rH(), 98 ether + 619_048 * 1e10);
+        assertEq(pool.rH(), 98 ether);
         assertEq(pool.rU(), 4_000e6 + 82_301_234);
         // pool price moved from 40.00 toward Core 42 without passing it
         assertGt(pool.poolPx(), 41_600_000);
@@ -262,15 +258,115 @@ contract HedgedPoolTest is Test {
         vm.prank(keeper);
         // pool 40 < Core 41.854: sell HYPE
         pool.start(true, 1 ether);
-        _setCoreBal(HYPE, 1e8);
+        _setCoreBal(HYPE, 1e6 + 1e8);
         vm.prank(keeper);
         pool.order();
         assertEq(
             writer.sent(0),
             abi.encodePacked(
                 hex"01000001",
-                abi.encode(uint32(11035), false, uint64(41.435e8), uint64(0.99e8), false, uint8(3), uint128(0))
+                abi.encode(uint32(11035), false, uint64(41.435e8), uint64(1e8), false, uint8(3), uint128(0))
             )
         );
+    }
+
+    // ------------------------------------------------------------ review r1 (Codex PoCs, fixed)
+
+    /// r1 high: a bridge that never arrives no longer freezes the pool forever.
+    function test_r1_stuckBridgeCanBeGivenUp() public {
+        _setCorePx(38_000_000);
+        vm.prank(keeper);
+        pool.start(false, 100e6);
+        vm.startPrank(keeper);
+        vm.expectRevert(HedgedPool.NotYet.selector);
+        pool.sendBack(); // too early to give up
+        skip(pool.STUCK_DELAY());
+        pool.sendBack();
+        pool.finish();
+        vm.stopPrank();
+        assertEq(uint8(pool.stage()), 0);
+        assertEq(pool.rU(), 3_900e6, "loss recognised");
+        uint256 s = pool.shares(lp);
+        vm.prank(lp);
+        pool.remove(s, 0, 0);
+    }
+
+    /// r1 high: a price reversal after `start` blocks the trade; the tokens come home untraded.
+    function test_r1_reversalReturnsUntraded() public {
+        _setCorePx(42_000_000);
+        vm.prank(keeper);
+        pool.start(true, 2 ether);
+        _setCorePx(30_000_000);
+        _setCoreBal(HYPE, 1e6 + 2e8);
+        vm.startPrank(keeper);
+        vm.expectRevert(HedgedPool.WrongDirection.selector);
+        pool.order();
+        pool.sendBack();
+        vm.stopPrank();
+        assertEq(pool.expectH(), 100 ether);
+        vm.deal(address(pool), 100 ether);
+        vm.prank(keeper);
+        pool.finish();
+        assertEq(pool.rH(), 100 ether);
+        assertEq(writer.count(), 1, "only the HYPE send, no order");
+    }
+
+    /// r1 medium: a retry while a credit is pending keeps it owed.
+    function test_r1_retryKeepsPendingCredit() public {
+        _setCorePx(42_000_000);
+        vm.prank(keeper);
+        pool.start(true, 2 ether);
+        _setCoreBal(HYPE, 1e6 + 2e8);
+        vm.prank(keeper);
+        pool.order();
+        skip(10);
+        _setCoreBal(HYPE, 1e6);
+        _setCoreBal(Core.USDC, 80e8);
+        vm.prank(keeper);
+        pool.sendBack();
+        assertEq(pool.expectU(), 4_080e6);
+
+        _setCoreBal(Core.USDC, 0); // debited on Core, not yet credited on the EVM
+        vm.startPrank(keeper);
+        pool.sendBack();
+        assertEq(pool.expectU(), 4_080e6, "still owed");
+        vm.expectRevert(HedgedPool.NotYet.selector);
+        pool.finish();
+        vm.stopPrank();
+
+        usdc.mint(address(pool), 80e6);
+        vm.prank(keeper);
+        pool.finish();
+        assertEq(pool.rU(), 4_080e6);
+    }
+
+    /// r1 medium: dust rebalances are refused up front.
+    function test_r1_dustRefused() public {
+        _setCorePx(42_000_000);
+        vm.prank(keeper);
+        vm.expectRevert(HedgedPool.TooSmall.selector);
+        pool.start(true, 1);
+    }
+
+    /// r1 low: the Core float is keeper-funded, outside the reserves.
+    function test_r1_opsFloatIsKeepers() public {
+        vm.deal(keeper, 1 ether);
+        vm.prank(keeper);
+        pool.fundOps{value: 0.05 ether}();
+        assertEq(Core.HYPE_SYSTEM.balance, 0.05 ether);
+        assertEq(pool.rH(), 100 ether);
+        assertEq(address(pool).balance, 100 ether);
+    }
+
+    function test_buyDisabledWithoutDepositWallet() public {
+        HedgedPool p2 = new HedgedPool(IERC20(address(usdc)), address(0), keeper, HYPE, SPOT, 2);
+        vm.startPrank(lp);
+        usdc.approve(address(p2), type(uint256).max);
+        p2.add{value: 100 ether}(4_000e6, 0);
+        vm.stopPrank();
+        _setCorePx(38_000_000);
+        vm.prank(keeper);
+        vm.expectRevert(HedgedPool.BuyDisabled.selector);
+        p2.start(false, 100e6);
     }
 }

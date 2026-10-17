@@ -1,0 +1,13 @@
+Most likely this is a **testnet eligibility restriction**, not a generic “contracts cannot hold Core USDC” rule.
+
+- **Confirmed:** Circle’s `CoreDepositWallet` does not test `extcodesize` or otherwise reject contract recipients. `depositFor(recipient, …)` accepts any nonzero, non-system, non-blacklisted address; both routes emit the system-address `Transfer` that HyperCore consumes. A successful EVM receipt/log therefore is not proof that HyperCore accepted the later action. [Circle source](https://github.com/circlefin/hyperevm-circle-contracts/blob/master/src/CoreDepositWallet.sol)
+
+- **Confirmed against “activation/finalization”:** an exact public testnet report describes a contract that already had testnet Core role `user` and Core HYPE, yet native-USDC deposit remained uncredited. Its reporter says direct Core funding also did not repair subsequent `depositFor` deposits. [Issue #138, observations](https://github.com/hyperliquid-dex/node/issues/138#issuecomment-3371846478)
+
+- **Strong but not official-documentation-confirmed explanation:** a later comment on that open issue attributes this to an HL Labs Discord statement: testnet addresses have a 1,000-USDC net-deposit limit and an address without a mainnet user/deposit history may only net-transfer out. It also reports that EOA recipients with mainnet deposit history worked, while contract recipients did not. This fits every control in the question, including why HYPE/Core account existence is insufficient. The Discord permalink is not publicly retrievable, so treat the policy wording as **reported**, not independently confirmed. [Issue #138 comment](https://github.com/hyperliquid-dex/node/issues/138#issuecomment-3378207076)
+
+- **Rejected:** no documented special Core action is required for a contract recipient. `depositFor` is precisely the contract-targeting function. The contract source even applies an account-creation fee only when `coreUserExists` is false. [Source](https://github.com/circlefin/hyperevm-circle-contracts/blob/master/src/CoreDepositWallet.sol#L2710-L2751)
+
+- **Testnet-only:** the original issue reports the same flow activating/contracts crediting on mainnet, while failing on chain 998. That is evidence, not an HL resolution. [Issue #138](https://github.com/hyperliquid-dex/node/issues/138)
+
+Recovery: no documented self-service recovery exists. The deposit wallet explicitly forbids rescuing its managed USDC, so these are not withdrawable via its rescue function. Use direct Core `usdSend`/`sendAsset` to fund test contracts on testnet, and contact Hyperliquid with tx hashes for reconciliation.
