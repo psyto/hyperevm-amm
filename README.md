@@ -57,6 +57,9 @@ recording CoreWriter).
 ## Things HyperEVM taught (measured on testnet)
 - CoreWriter actions run after the EVM block; spot IOCs filled within 1.5 s on testnet. Nothing comes back.
 - Order sizes are × 1e8, but the position precompile returns `szDecimals` units.
+- USDC sent EVM → Core through Circle's CoreDepositWallet never arrived in a contract's Core
+  account (an EOA's arrived within 1 s). Reported as a testnet-only restriction; untested on
+  mainnet. Core → EVM worked, so the pool only ever moves USDC that way.
 - Core → EVM credits do not call `receive()`; contracts only see a larger balance.
 - A contract's Core account is not unified: spot and perp are separate.
 - The first transfer into a new Core account pays ~1 USDC of activation.
