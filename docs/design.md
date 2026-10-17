@@ -14,7 +14,11 @@ market itself: HyperCore spot `@1035` on testnet (`@107` HYPE/USDC on mainnet) t
   precompile (`coreU()`). The pool's USDC is `reserveU() = rU + coreU()`; prices and LP shares use
   it. USDC can only be paid out from `rU`, so a swap or a withdrawal larger than `rU` reverts
   (`NotEnoughEvmUsdc`) until the keeper brings float over.
-- HYPE on Core beyond the keeper's ops float is not counted while Idle (it should not be there).
+- **HYPE on Core counts too** (review r3): `reserveH() = rH + coreH()`, Core HYPE above the
+  keeper's ops float. A CoreWriter order can fill at any time after `order()`, with no
+  settlement signal on the EVM; with both Core balances counted, a late fill only moves value
+  between them. HYPE is paid out only from `rH` (`NotEnoughEvmHype`).
+- The first mint is the keeper's: a float already on Core would otherwise go to whoever mints first.
 - LP shares, proportional mint/burn. A rebalance state: `Idle → OnCore → Ordered → Returning → Idle`.
 
 ## Why a float
@@ -24,7 +28,7 @@ ever moves Core → EVM: sales on Core fill the float, buys on Core spend it, an
 float to the EVM when it is needed there.
 
 ## Swaps
-x·y=k with a fee on `rH` / `reserveU()`, `minOut`. Swaps, adds and removes are paused while a
+x·y=k with a fee on `reserveH()` / `reserveU()`, `minOut`. Swaps, adds and removes are paused while a
 rebalance is in flight.
 
 ## Invariant (review r1)

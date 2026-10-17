@@ -54,12 +54,18 @@ contract HedgedPoolTest is Test {
         _setCoreBal(HYPE, 1e6);
         _setCoreBal(Core.USDC, 0);
 
-        // 100 HYPE + 4,000 USDC: pool price 40.00
+        // 100 HYPE + 4,000 USDC: pool price 40.00. The keeper seeds the first 1%.
+        vm.deal(keeper, 1 ether);
+        usdc.mint(keeper, 40e6);
+        vm.startPrank(keeper);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 1 ether}(40e6, 0);
+        vm.stopPrank();
         vm.deal(lp, 1000 ether);
         usdc.mint(lp, 1_000_000e6);
         vm.startPrank(lp);
         usdc.approve(address(pool), type(uint256).max);
-        pool.add{value: 100 ether}(4_000e6, 0);
+        pool.add{value: 99 ether}(3_960e6, 0);
         vm.stopPrank();
 
         vm.deal(trader, 1000 ether);
@@ -121,8 +127,8 @@ contract HedgedPoolTest is Test {
         uint256 s = pool.shares(lp);
         vm.prank(lp);
         (uint256 h, uint256 u) = pool.remove(s, 0, 0);
-        assertGt(h, 99.99 ether);
-        assertGt(u, 3_999e6);
+        assertGt(h, 98.99 ether);
+        assertGt(u, 3_959e6);
     }
 
     /// The Core float counts in prices and shares, but USDC can only be paid out from the EVM.
@@ -148,7 +154,7 @@ contract HedgedPoolTest is Test {
 
         vm.prank(lp);
         (, uint256 u) = pool.remove(s, 0, 0);
-        assertGt(u, 4_199e6);
+        assertGt(u, 4_157e6); // 99% of 4,200
     }
 
     // ------------------------------------------------------------ rebalance math
@@ -435,5 +441,60 @@ contract HedgedPoolTest is Test {
         pool.finish();
         vm.stopPrank();
         assertEq(pool.rH(), 100 ether);
+    }
+
+    // ------------------------------------------------------------ review r3
+
+    /// r3 high: an IOC that fills after the round closed is still in the books, because Core
+    /// balances count on both sides.
+    function test_r3_lateFillAfterFinishStaysInTheBooks() public {
+        _setCoreBal(Core.USDC, 200e8);
+        _setCorePx(38_000_000);
+        vm.startPrank(keeper);
+        pool.start(false, 100e6);
+        pool.order();
+        skip(10);
+        pool.sendBack(0); // the IOC has not run yet: Core unchanged
+        pool.finish();
+        vm.stopPrank();
+        assertEq(pool.reserveH(), 100 ether);
+        assertEq(pool.reserveU(), 4_200e6);
+
+        // the IOC runs now: 100 USDC of float become 2.6 HYPE on Core
+        _setCoreBal(HYPE, 1e6 + 2.6e8);
+        _setCoreBal(Core.USDC, 100.2e8);
+        assertEq(pool.reserveH(), 102.6 ether);
+        assertEq(pool.reserveU(), 4_100.2e6);
+
+        // a trader gets exactly the reconciled quote
+        uint256 hIn = 1 ether * 9970;
+        uint256 reconciled = hIn * 4_100.2e6 / (102.6 ether * 10_000 + hIn);
+        vm.prank(trader);
+        uint256 out = pool.swapHypeForUsdc{value: 1 ether}(0);
+        assertEq(out, reconciled);
+    }
+
+    /// r3 medium: a float sent to the pool's Core account before anyone minted cannot be
+    /// captured by a stranger minting first.
+    function test_r3_firstMintIsKeepers() public {
+        HedgedPool fresh = new HedgedPool(IERC20(address(usdc)), keeper, HYPE, SPOT, 2);
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(fresh), Core.USDC), abi.encode(Core.SpotBalance(500e8, 0, 0))
+        );
+        vm.startPrank(trader);
+        usdc.approve(address(fresh), type(uint256).max);
+        vm.expectRevert(HedgedPool.NotKeeper.selector);
+        fresh.add{value: 0.01 ether}(11e6, 0);
+        vm.stopPrank();
+    }
+
+    /// HYPE on Core counts, but HYPE is paid out only from the EVM.
+    function test_r3_coreHypePaysFromEvm() public {
+        _setCoreBal(HYPE, 1e6 + 10e8); // 10 HYPE on Core
+        assertEq(pool.reserveH(), 110 ether);
+        uint256 s = pool.shares(lp);
+        vm.prank(lp);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.NotEnoughEvmHype.selector, 100 ether));
+        pool.remove(s, 0, 0);
     }
 }
