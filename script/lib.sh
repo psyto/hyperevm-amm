@@ -2,7 +2,7 @@
 # The public testnet RPC rate-limits hard (-32005). A rate-limited `cast send` may still have
 # been broadcast, so `tx` never resends: it checks the nonce first and only reports.
 R=${RPC_URL:-https://rpc.hyperliquid-testnet.xyz/evm}
-K=$(cat "${KEY_FILE:-$HOME/.old-testnet.key}")
+K=$(cat "${KEY_FILE:-$HOME/.hyperevm-amm-testnet.key}")
 ME=$(cast wallet address --private-key "$K")
 
 # Read with retries.

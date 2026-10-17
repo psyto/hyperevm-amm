@@ -3,7 +3,7 @@
     uv run --with hyperliquid-python-sdk python -I script/core_send.py <to> <usd> [--mainnet]
     uv run --with hyperliquid-python-sdk python -I script/core_send.py --state <addr> [--mainnet]
 
-Reads the private key from KEY_FILE (default ~/.old-testnet.key). Sending to an address
+Reads the private key from KEY_FILE (default ~/.hyperevm-amm-testnet.key). Sending to an address
 with no HyperCore account creates one.
 """
 import json, os, sys
@@ -28,7 +28,7 @@ if args[0] == "--state":
         print(q["type"], json.dumps(info.post("/info", {**q, "user": user}))[:800])
     sys.exit()
 
-key = open(os.path.expanduser(os.environ.get("KEY_FILE", "~/.old-testnet.key"))).read().strip()
+key = open(os.path.expanduser(os.environ.get("KEY_FILE", "~/.hyperevm-amm-testnet.key"))).read().strip()
 wallet = Account.from_key(key)
 ex = Exchange(wallet, url, **empty)
 print("from", wallet.address, "api", url)
