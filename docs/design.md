@@ -31,13 +31,23 @@ float to the EVM when it is needed there.
 x·y=k with a fee on `reserveH()` / `reserveU()`, `minOut`. Swaps, adds and removes are paused while a
 rebalance is in flight.
 
-## Invariant (review r1)
-What leaves the EVM reserves or the float for the other side stays owed until it is seen there.
-`sendBack` fixes `expectH`/`expectU` once; retries (in a later block) resend only what a dropped
-send left on Core (`floatAfter`) and never lower them. Ways out of every stage: `order` reverts if
+## Invariants
+1. What leaves the EVM reserves or the float for the other side stays owed until it is seen there
+   (review r1). `sendBack` fixes `expectH`/`expectU` once; retries (in a later block) resend only
+   what a dropped send left on Core (`floatAfter`) and never lower them. After `SETTLE_DELAY`,
+   `finish` closes at the actual balances: a send Core rejected left its tokens on Core, counted.
+2. Never send from Core a balance a pending order can still lower (review r4). For `SPEND_LOCK`
+   after an order, the token it spends stays on Core; the token it receives only grows, so its
+   read is a safe lower bound. The EVM gets no settlement signal for CoreWriter orders, so this
+   rests on timing: 1 hour against fills measured within 4 s.
+3. Everything on the pool's Core account counts (review r3); only the EVM side pays out.
+
+Other rules: Ways out of every stage: `order` reverts if
 the price has turned (then `sendBack` returns the HYPE untraded); `sendBack` from `OnCore` once
 the HYPE has arrived, or after `STUCK_DELAY`. Rebalances under 11 USDC are refused. The Core HYPE
-float is keeper-funded (`fundOps`).
+float is keeper-funded (`fundOps`), and `start` requires it (review r4: otherwise activation is
+paid from LP HYPE). `sendBack` from `Idle` and `finish` are open to anyone, so Core inventory
+(including donations) can always be brought to the EVM for payouts.
 
 ## Rebalance (keeper, v1 owner-only)
 1. **start(sellHype, amount)** — sell: bridge HYPE to `0x2222…`. Buy: earmark `amount` of the float
@@ -46,9 +56,11 @@ float is keeper-funded (`fundOps`).
    Core), then one IOC on the Core spot market. Limit: 1% off the Core spot price (0x808), but
    never worse than the pool's own price (review r2: the order runs seconds later), rounded to
    the tick away from a loss (sell up, buy down).
-3. **sendBack(uToEvm)** — after the order delay: HYPE above the ops float back to the EVM, plus
-   `uToEvm` of the USDC float; the rest stays as float. Also callable from `Idle` to move float.
-4. **finish()** — when the EVM balances reach what was sent, set `rH`/`rU` to them and unpause.
+3. **sendBack(uToEvm)** — after the order delay: the token the order received back to the EVM
+   (HYPE above the ops float, or up to `uToEvm` of the USDC float); the token it spent stays on
+   Core for `SPEND_LOCK`. Also callable from `Idle`, by anyone.
+4. **finish()** — when the EVM balances reach what was sent (or after `SETTLE_DELAY`), set
+   `rH`/`rU` to them and unpause. Anyone can call it.
 
 How far to rebalance: only toward the Core price, never past it — the amount that moves
 `reserveU/reserveH` to the Core mid, capped per call.
@@ -66,8 +78,8 @@ How far to rebalance: only toward the Core price, never past it — the amount t
   EVM USDC 6.
 
 ## Reviews
-Codex, adversarial, with PoCs (docs/reviews/): r1 5 findings, r2 2, r3 2, all fixed with
-regression tests (`test_r1_*` … `test_r3_*`). r4 in progress.
+Codex, adversarial, with PoCs (docs/reviews/): r1 5 findings, r2 2, r3 2, r4 3, all fixed with
+regression tests (`test_r1_*` … `test_r4_*`). r5 in progress.
 
 ## Open
 - The pool has not run on testnet yet (needs ~1.5 testnet HYPE for an 11 USDC rebalance).

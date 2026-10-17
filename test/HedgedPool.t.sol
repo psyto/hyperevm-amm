@@ -497,4 +497,109 @@ contract HedgedPoolTest is Test {
         vm.expectRevert(abi.encodeWithSelector(HedgedPool.NotEnoughEvmHype.selector, 100 ether));
         pool.remove(s, 0, 0);
     }
+
+    // ------------------------------------------------------------ review r4
+
+    /// r4 high (sell): the IOC fills after `sendBack` read Core. HYPE, which the sell spends, is
+    /// not sent, so nothing promised can be taken away; the round closes on the USDC alone.
+    function test_r4_sellFillAfterSendBackRead() public {
+        _setCorePx(42_000_000);
+        vm.startPrank(keeper);
+        pool.start(true, 2 ether);
+        _setCoreBal(HYPE, 1e6 + 2e8);
+        pool.order();
+        skip(10);
+        _setCoreBal(Core.USDC, 10e8); // an old 10 USDC float; the IOC has not run
+        pool.sendBack(10e8);
+        vm.stopPrank();
+        assertEq(writer.count(), 2, "order + USDC only");
+        assertEq(writer.sent(1), _send(address(0x2000000000000000000000000000000000000000), 0, 10e8));
+        assertEq(pool.expectH(), 98 ether, "no HYPE promised");
+
+        // the IOC runs now: 2 HYPE -> 82.30 USDC; the 10 USDC send still lands
+        _setCoreBal(HYPE, 1e6);
+        _setCoreBal(Core.USDC, 8_230_123_456);
+        usdc.mint(address(pool), 10e6);
+        pool.finish();
+        assertEq(pool.rU(), 4_010e6);
+        assertEq(pool.reserveU(), 4_010e6 + 82_301_234);
+        assertEq(pool.reserveH(), 98 ether);
+    }
+
+    /// r4 high (buy): USDC, which the buy spends, stays on Core while the order may run.
+    function test_r4_buyLocksUsdc() public {
+        _setCoreBal(Core.USDC, 200e8);
+        _setCorePx(38_000_000);
+        vm.startPrank(keeper);
+        pool.start(false, 100e6);
+        pool.order();
+        skip(10);
+        pool.sendBack(200e8);
+        vm.stopPrank();
+        assertEq(writer.count(), 1, "nothing sent");
+        assertEq(pool.expectU(), 4_000e6);
+        pool.finish();
+
+        // still locked from Idle within SPEND_LOCK; free afterwards
+        vm.prank(trader);
+        pool.sendBack(200e8);
+        assertEq(writer.count(), 1);
+        pool.finish();
+        skip(pool.SPEND_LOCK());
+        vm.prank(trader);
+        pool.sendBack(200e8);
+        assertEq(writer.sent(1), _send(address(0x2000000000000000000000000000000000000000), 0, 200e8));
+    }
+
+    /// r4: a send Core rejects cannot block `finish` forever; its tokens stay on Core, counted.
+    function test_r4_rejectedSendSettlesAfterDelay() public {
+        _sellAndFill();
+        vm.prank(keeper);
+        pool.sendBack(80e8);
+        vm.expectRevert(HedgedPool.NotYet.selector);
+        pool.finish();
+        skip(pool.SETTLE_DELAY());
+        pool.finish(); // Core still shows 82.30: the send never happened
+        assertEq(pool.rU(), 4_000e6);
+        assertEq(pool.reserveU(), 4_000e6 + 82_301_234, "nothing lost");
+    }
+
+    /// r4 medium: HYPE donated to the pool's Core account cannot freeze withdrawals: anyone can
+    /// bring Core inventory to the EVM.
+    function test_r4_anyoneUnfreezesCoreHype() public {
+        _setCoreBal(HYPE, 1e6 + 100e8);
+        uint256 s = pool.shares(lp);
+        vm.prank(lp);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.NotEnoughEvmHype.selector, 100 ether));
+        pool.remove(s, 0, 0);
+
+        vm.prank(trader);
+        pool.sendBack(0);
+        assertEq(writer.sent(0), _send(Core.HYPE_SYSTEM, HYPE, 100e8));
+        _setCoreBal(HYPE, 1e6);
+        vm.deal(address(pool), 200 ether);
+        vm.prank(trader);
+        pool.finish();
+        vm.prank(lp);
+        (uint256 h,) = pool.remove(s, 0, 0);
+        assertGt(h, 197 ether); // 99% of 200
+    }
+
+    /// r4 low: no rebalance before the keeper has funded the Core account.
+    function test_r4_startNeedsOpsFloat() public {
+        _setCoreBal(HYPE, 0);
+        _setCorePx(42_000_000);
+        vm.prank(keeper);
+        vm.expectRevert(HedgedPool.NoOpsFloat.selector);
+        pool.start(true, 2 ether);
+    }
+
+    function test_r4_onlyKeeperOutsideIdle() public {
+        _setCorePx(42_000_000);
+        vm.prank(keeper);
+        pool.start(true, 2 ether);
+        vm.prank(trader);
+        vm.expectRevert(HedgedPool.NotKeeper.selector);
+        pool.sendBack(0);
+    }
 }

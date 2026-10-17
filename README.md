@@ -5,8 +5,8 @@ to the HyperCore price by trading on HyperCore**, instead of leaving it to outsi
 
 Status (2026-10-17): a learning project, not audited, not for real funds. The contract-side
 building blocks (orders, transfers both ways) have run on HyperEVM testnet; the pool itself
-has only run in tests. It has been through three adversarial review rounds by Codex (all
-CHANGES, all fixed); round 4 is in progress.
+has only run in tests. It has been through four adversarial review rounds by Codex (all
+CHANGES, all fixed); round 5 is in progress.
 
 ## How it works
 - **Reserves live in two places.** HYPE and USDC on the EVM (`rH`, `rU`) and on the pool's own
@@ -19,8 +19,9 @@ CHANGES, all fixed); round 4 is in progress.
 - **USDC only moves Core → EVM.** Sales on Core fill the USDC float, buys spend it, and the keeper
   moves float to the EVM when traders or LPs need it there. (USDC sent EVM → Core into a
   contract's Core account never arrived on testnet.)
-- **Invariant.** What leaves one side stays owed until it is seen on the other. IOC limits never
-  cross the pool price. Every stage has a way out.
+- **Invariants.** What leaves one side stays owed until it is seen on the other. A balance a
+  pending order can still lower is never sent. IOC limits never cross the pool price. Every
+  stage has a way out, and anyone can bring Core inventory to the EVM.
 
 Details: [docs/design.md](docs/design.md).
 
@@ -32,7 +33,7 @@ Details: [docs/design.md](docs/design.md).
 | `src/CoreProbe.sol` | a small contract used to measure HyperCore behaviour on testnet |
 | `docs/step0-corewriter.md` | testnet: a contract trading on HyperCore and reading the result back |
 | `docs/step1-bridging.md` | testnet: moving HYPE and USDC between the EVM and Core from a contract |
-| `docs/reviews/` | Codex review rounds: payloads, outputs, PoCs, and what was fixed (`r1.md`–`r3.md`) |
+| `docs/reviews/` | Codex review rounds: payloads, outputs, PoCs, and what was fixed (`r1.md`–`r4.md`) |
 | `script/lib.sh` | rate-limit-safe `cast` helpers for the public testnet RPC |
 | `script/core_send.py` | send USDC on HyperCore, or print an address's Core state (`--state`) |
 
@@ -40,7 +41,7 @@ Details: [docs/design.md](docs/design.md).
 ```
 forge test
 ```
-27 tests: CoreWriter encodings, and the pool against a simulated Core (mocked precompiles and a
+33 tests: CoreWriter encodings, and the pool against a simulated Core (mocked precompiles and a
 recording CoreWriter).
 
 ## Things HyperEVM taught (measured on testnet)

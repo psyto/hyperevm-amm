@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {Core, IERC20} from "../../src/Core.sol";
+import {HedgedPool} from "../../src/HedgedPool.sol";
+
+/// @dev CoreWriter replacement.  The test changes 0x801 after an EVM snapshot to model the
+/// CoreWriter ordering documented by Hyperliquid: reads occur while the EVM block is built and
+/// queued actions are processed afterwards.
+contract R4Writer {
+    bytes[] internal actions;
+
+    function sendRawAction(bytes calldata action) external {
+        actions.push(action);
+    }
+}
+
+contract R4USDC {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+contract Round4CoreHypePoC is Test {
+    uint64 internal constant HYPE = 1105;
+    uint64 internal constant SPOT = 1035;
+    uint64 internal constant OPS = 1e6;
+
+    HedgedPool internal pool;
+    R4USDC internal usdc;
+    address internal keeper = address(0xC0FFEE);
+    address internal lp = address(0x1F);
+
+    function setUp() public {
+        vm.etch(address(Core.WRITER), address(new R4Writer()).code);
+        usdc = new R4USDC();
+        pool = new HedgedPool(IERC20(address(usdc)), keeper, HYPE, SPOT, 2);
+        _core(HYPE, OPS);
+        _core(Core.USDC, 0);
+
+        vm.deal(keeper, 2 ether);
+        usdc.mint(keeper, 40e6);
+        vm.startPrank(keeper);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 1 ether}(40e6, 0);
+        vm.stopPrank();
+
+        vm.deal(lp, 100 ether);
+        usdc.mint(lp, 3_960e6);
+        vm.startPrank(lp);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 99 ether}(3_960e6, 0);
+        vm.stopPrank();
+    }
+
+    function _core(uint64 token, uint64 total) internal {
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(pool), token), abi.encode(Core.SpotBalance(total, 0, 0))
+        );
+    }
+
+    function _px(uint64 p) internal {
+        vm.mockCall(Core.SPOT_PX, abi.encode(SPOT), abi.encode(p));
+    }
+
+    /// @dev High: sendBack fixes an HYPE expectation from a pre-settlement read.  If the old IOC
+    /// executes after that read but before its newer sendAsset action, it spends the HYPE that the
+    /// snapshot promised to bridge.  The HYPE send is rejected on Core, while the immutable
+    /// expectation remains 100 HYPE.  No pool-owned path can lower it.
+    function test_PoC_sellFillBetweenSendBackReadAndCoreSendFreezesPool() public {
+        _px(42e6);
+        vm.startPrank(keeper);
+        pool.start(true, 2 ether);
+        _core(HYPE, OPS + 2e8); // bridge arrived; IOC is accepted but not yet executed
+        pool.order();
+        skip(pool.ORDER_DELAY());
+
+        // EVM block B: 0x801 still shows the unfilled sell.  sendBack enqueues a 2-HYPE send.
+        pool.sendBack(0);
+        assertEq(pool.expectH(), 100 ether);
+        assertEq(address(pool).balance, 98 ether);
+
+        // After B is built, the older delayed IOC executes first.  It consumes the two HYPE;
+        // the later 2-HYPE sendAsset has insufficient balance and is rejected.  The USDC fill is
+        // real pool value, but cannot satisfy expectH.
+        _core(HYPE, OPS);
+        _core(Core.USDC, 8_230_123_456);
+        vm.expectRevert(HedgedPool.NotYet.selector);
+        pool.finish();
+
+        // Retry only returns the USDC.  expectH is deliberately immutable and is still unmet.
+        vm.roll(block.number + 1);
+        pool.sendBack(0);
+        usdc.mint(address(pool), 82_301_234);
+        vm.expectRevert(HedgedPool.NotYet.selector);
+        pool.finish();
+        vm.stopPrank();
+    }
+
+    /// @dev Same snapshot race on the buy leg.  The first send promised 200 USDC to EVM, but a
+    /// delayed IOC spends 99.8 USDC before that send is processed.  A retry can send only 100.2,
+    /// leaving the round frozen unless somebody donates the missing 99.8 USDC to the pool.
+    function test_PoC_buyFillBetweenSendBackReadAndCoreSendFreezesPool() public {
+        _core(Core.USDC, 200e8);
+        _px(38e6);
+        vm.startPrank(keeper);
+        pool.start(false, 100e6);
+        pool.order();
+        skip(pool.ORDER_DELAY());
+
+        pool.sendBack(200e8);
+        assertEq(pool.expectU(), 4_200e6);
+
+        // The IOC executes after the EVM snapshot and before its 200-USDC sendAsset action.
+        _core(HYPE, OPS + 2.6e8);
+        _core(Core.USDC, 100.2e8);
+        vm.expectRevert(HedgedPool.NotYet.selector);
+        pool.finish();
+
+        // The retry returns all USDC that actually remains, but cannot revise expectU.
+        vm.roll(block.number + 1);
+        pool.sendBack(0);
+        _core(Core.USDC, 0);
+        usdc.mint(address(pool), 100.2e6);
+        vm.expectRevert(HedgedPool.NotYet.selector);
+        pool.finish();
+        vm.stopPrank();
+    }
+
+    /// @dev Medium: anyone able to make a Core spot transfer to the pool can increase live
+    /// reserveH without increasing rH.  A normal LP's proportional burn is then unpayable and
+    /// stays so until the keeper notices and bridges the unsolicited Core HYPE back.
+    function test_PoC_coreHypeDonationFreezesLargeWithdrawal() public {
+        _core(HYPE, OPS + 100e8); // third party donates 100 HYPE directly to the Core account
+        assertEq(pool.reserveH(), 200 ether);
+        assertEq(pool.rH(), 100 ether);
+
+        uint256 lpShares = pool.shares(lp);
+        vm.prank(lp);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.NotEnoughEvmHype.selector, 100 ether));
+        pool.remove(lpShares, 0, 0);
+    }
+
+    /// @dev Low: the measured first-transfer activation fee is charged from the HYPE bridge if
+    /// the keeper did not activate/fund the Core account first.  sendBack also leaves KEEP_HYPE_WEI
+    /// behind, so both the fee and the initial ops float come out of LP HYPE despite fundOps' and
+    /// the design document's keeper-funded promise.
+    function test_PoC_unactivatedFirstSellChargesActivationAndOpsToLps() public {
+        uint64 activationFee = 2_321_424; // 0.02321424 HYPE: docs/step1-bridging.md measurement
+        _px(42e6);
+        vm.startPrank(keeper);
+        pool.start(true, 2 ether);
+
+        // Core credits the bridge less activation gas.  No keeper-funded ops balance existed.
+        uint64 landed = 2e8 - activationFee;
+        _core(HYPE, landed);
+        pool.sendBack(0); // OnCore: bring the untraded HYPE home
+        uint256 returned = uint256(landed - OPS) * 1e10;
+        _core(HYPE, OPS);
+        vm.deal(address(pool), 98 ether + returned);
+        pool.finish();
+        vm.stopPrank();
+
+        assertEq(pool.rH(), 98 ether + returned);
+        assertEq(100 ether - pool.rH(), uint256(activationFee + OPS) * 1e10);
+    }
+}
