@@ -27,7 +27,7 @@ import {Core, IERC20} from "./Core.sol";
 /// the USDC float floor the keeper keeps for buys.
 contract HedgedPool {
     uint256 public constant FEE_BPS = 30;
-    uint256 public constant SLIPPAGE_BPS = 100; // IOC limit vs Core spot price
+    uint256 public constant MAX_SPREAD_BPS = 500; // no orders into a Core book wider than this
     uint256 public constant MIN_NOTIONAL = 11e6; // USDC; Core spot rejects orders under 10 USDC
     uint256 public constant QUIET_BLOCKS = 2; // one block for the documented ordering, one spare
     uint256 public constant ORDER_QUIET = 30; // seconds; ~10x the measured fill delay (<= 4 s)
@@ -65,6 +65,7 @@ contract HedgedPool {
     error NotEnoughEvmUsdc(uint256 have);
     error NotEnoughEvmHype(uint256 have);
     error NoCoreAccount();
+    error WideBook(uint256 spreadBps);
 
     constructor(IERC20 usdc_, address keeper_, uint64 hypeToken_, uint64 spotIndex_, uint8 hypeSzDecimals_) {
         usdc = usdc_;
@@ -174,9 +175,20 @@ contract HedgedPool {
 
     // ---------------------------------------------------------------- rebalance (keeper)
 
-    /// Core spot price, USDC per HYPE with 6 decimals.
+    /// Core best bid and ask, USDC per HYPE with 6 decimals. The last trade price (0x808) is not
+    /// used: on a wide book it sits at one side, and a limit set off it may never fill (testnet).
+    function coreBbo() public view returns (uint256 bid, uint256 ask) {
+        (uint64 b, uint64 a) = Core.bbo(uint32(10_000 + spotIndex)); // 8 - szDecimals decimals
+        return (_to6(b), _to6(a));
+    }
+
+    /// Core mid price, USDC per HYPE with 6 decimals: what the pool rebalances toward.
     function corePx() public view returns (uint256) {
-        uint256 px = Core.spotPx(spotIndex); // 8 - szDecimals decimals
+        (uint256 bid, uint256 ask) = coreBbo();
+        return (bid + ask) / 2;
+    }
+
+    function _to6(uint256 px) internal view returns (uint256) {
         uint8 d = 8 - hypeSzDecimals;
         return d >= 6 ? px / 10 ** (d - 6) : px * 10 ** (6 - d);
     }
@@ -236,13 +248,16 @@ contract HedgedPool {
 
     /// One IOC on the Core spot market, spending at most `amount` of what is on Core (HYPE, 18
     /// decimals, to sell; USDC, 6 decimals, to buy) and no more than `maxRebalance`. The limit is
-    /// `SLIPPAGE_BPS` off the Core price but never worse than the pool's own price: the order runs
-    /// seconds later (review r2). If Core rejects it, or it fills late, only counted balances
-    /// change.
+    /// the best bid (sell) or ask (buy), but never worse than the pool's own price: the order runs
+    /// later (review r2). No order into a book wider than `MAX_SPREAD_BPS`. If Core rejects it,
+    /// or it fills late, only counted balances change.
     function order(bool sellHype, uint256 amount) external onlyKeeper settled {
-        uint256 p = corePx(); // 6 decimals
+        (uint256 bid, uint256 ask) = coreBbo(); // 6 decimals
+        uint256 p = (bid + ask) / 2;
+        uint256 spread = (ask - bid) * 10_000 / p;
+        if (spread > MAX_SPREAD_BPS) revert WideBook(spread);
         uint256 pool = poolPx();
-        (bool dir, uint256 max) = maxRebalance();
+        (bool dir, uint256 max) = _maxRebalance(reserveH(), reserveU(), p);
         if (dir != sellHype || max == 0) revert WrongDirection();
 
         uint64 lotWei = uint64(10 ** (8 - hypeSzDecimals)); // size step, in 1e8 units
@@ -251,12 +266,10 @@ contract HedgedPool {
         if (sellHype) {
             uint256 h = _min(_min(amount, max), coreH()) / 1e10; // 18 -> 8 decimals
             sz = uint64(h) / lotWei * lotWei;
-            limit = p * (10_000 - SLIPPAGE_BPS) / 10_000;
-            if (limit < pool) limit = pool; // never sell below the pool price
+            limit = bid < pool ? pool : bid; // never sell below the pool price
         } else {
             uint256 spend = _min(_min(amount, max), coreU()) * 100; // USDC, 8 decimals
-            limit = p * (10_000 + SLIPPAGE_BPS) / 10_000;
-            if (limit > pool) limit = pool; // never buy above the pool price
+            limit = ask > pool ? pool : ask; // never buy above the pool price
             // HYPE (1e8 units) = USDC (1e8) / price (1e6) * 1e6
             sz = uint64(spend * 1e6 / limit) / lotWei * lotWei;
         }

@@ -77,9 +77,14 @@ contract HedgedPoolTest is Test {
         usdc.approve(address(pool), type(uint256).max);
     }
 
+    /// A Core book with no spread at `px6`.
     function _setCorePx(uint64 px6) internal {
-        // szDecimals 2 -> Core spot price has 6 decimals
-        vm.mockCall(Core.SPOT_PX, abi.encode(SPOT), abi.encode(px6));
+        _setBbo(px6, px6);
+    }
+
+    function _setBbo(uint64 bid6, uint64 ask6) internal {
+        // szDecimals 2 -> Core spot prices have 6 decimals; BBO takes the asset id 10000 + spot
+        vm.mockCall(Core.BBO, abi.encode(uint32(11035)), abi.encode(bid6, ask6));
     }
 
     function _setCoreBal(uint64 token, uint64 wei8) internal {
@@ -309,8 +314,8 @@ contract HedgedPoolTest is Test {
         assertEq(pool.reserveH(), 100 ether);
         vm.prank(keeper);
         pool.order(true, 2 ether);
-        // sells 2.00 (under the 2.381 cap); limit 42 × 0.99 = 41.58
-        assertEq(writer.sent(0), _order(false, 41.58e8, 2e8));
+        // sells 2.00 (under the 2.381 cap) at the best bid
+        assertEq(writer.sent(0), _order(false, 42e8, 2e8));
 
         // filled whenever: 2 HYPE on Core became 82.30 USDC on Core; both are counted
         _setCoreBal(HYPE, 1e6);
@@ -335,21 +340,28 @@ contract HedgedPoolTest is Test {
         assertEq(pool.reserveH(), 100 ether);
     }
 
-    /// r2: the IOC runs seconds after `order`; its limit must not cross the pool price.
+    /// r2: the IOC runs later; its limit must not cross the pool price. Ticks round away from a loss.
     function test_sellLimitNeverBelowPool() public {
-        _setCoreBal(HYPE, 1e6 + 0.3e8); // pool 4000 / 100.3 = 39.88; Core 40.3 − 1% = 39.897
+        _setCoreBal(HYPE, 1e6 + 0.3e8); // pool 4000 / 100.3 = 39.880358...
         _setCorePx(40_300_000);
         vm.prank(keeper);
         pool.order(true, 0.3 ether);
-        assertEq(writer.sent(0), _order(false, 39.897e8, 0.3e8));
+        assertEq(writer.sent(0), _order(false, 40.3e8, 0.3e8), "at the bid");
 
         skip(pool.ORDER_QUIET());
-        _setCoreBal(HYPE, 1e6 + 0.3e8);
-        _setCorePx(40_000_000 + 220_000); // Core 40.22 − 1% = 39.818 < pool 39.88
+        _setBbo(39_818_000, 40_620_000); // bid below the pool price
         vm.prank(keeper);
         pool.order(true, 0.3 ether);
-        // limit lifted to the pool price 39.880358…, rounded up to 39.881
+        // lifted to the pool price, 5 significant figures rounded up: 39.881
         assertEq(writer.sent(1), _order(false, 39.881e8, 0.3e8));
+    }
+
+    function test_wideBookRefused() public {
+        _setCoreBal(HYPE, 1e6 + 2e8);
+        _setBbo(40_000_000, 44_000_000); // 9.5% wide
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.WideBook.selector, 952));
+        pool.order(true, 2 ether);
     }
 
     function test_buyWithFloat() public {
@@ -357,24 +369,24 @@ contract HedgedPoolTest is Test {
         _setCorePx(38_000_000);
         vm.prank(keeper);
         pool.order(false, 100e6);
-        // limit 38 × 1.01 = 38.38; size 100 / 38.38 = 2.6055 -> 2.60
-        assertEq(writer.sent(0), _order(true, 38.38e8, 2.6e8));
+        // at the best ask 38; size 100 / 38 = 2.6315 -> 2.63
+        assertEq(writer.sent(0), _order(true, 38e8, 2.63e8));
 
-        // filled: 99.8 USDC of float became 2.6 HYPE on Core
-        _setCoreBal(HYPE, 1e6 + 2.6e8);
-        _setCoreBal(Core.USDC, 100.2e8);
-        assertEq(pool.reserveH(), 102.6 ether);
+        // filled: 99.94 USDC of float became 2.63 HYPE on Core
+        _setCoreBal(HYPE, 1e6 + 2.63e8);
+        _setCoreBal(Core.USDC, 100.06e8);
+        assertEq(pool.reserveH(), 102.63 ether);
 
         // anyone brings the HYPE over, once the order quiet has passed
         skip(pool.ORDER_QUIET());
         vm.prank(trader);
-        pool.toEvm(2.6e8, 0);
-        assertEq(writer.sent(1), _send(Core.HYPE_SYSTEM, HYPE, 2.6e8));
+        pool.toEvm(2.63e8, 0);
+        assertEq(writer.sent(1), _send(Core.HYPE_SYSTEM, HYPE, 2.63e8));
         _setCoreBal(HYPE, 1e6);
-        vm.deal(address(pool), 102.6 ether);
+        vm.deal(address(pool), 102.63 ether);
         _pastQuiet();
-        assertEq(pool.reserveH(), 102.6 ether);
-        assertEq(pool.reserveU(), 4_000e6 + 100.2e6);
+        assertEq(pool.reserveH(), 102.63 ether);
+        assertEq(pool.reserveU(), 4_000e6 + 100.06e6);
     }
 
     function test_buyLimitedToFloat() public {
@@ -382,25 +394,17 @@ contract HedgedPoolTest is Test {
         _setCorePx(38_000_000);
         vm.prank(keeper);
         pool.order(false, 50e6);
-        // spends the 20 USDC on Core: 20 / 38.38 = 0.521 -> 0.52
-        assertEq(writer.sent(0), _order(true, 38.38e8, 0.52e8));
+        // spends the 20 USDC on Core: 20 / 38 = 0.526 -> 0.52
+        assertEq(writer.sent(0), _order(true, 38e8, 0.52e8));
     }
 
     function test_buyLimitNeverAbovePool() public {
-        _setCoreBal(Core.USDC, 200e8); // pool 42.00; Core 41.7 + 1% would be 42.117
-        _setCorePx(41_700_000);
+        _setCoreBal(Core.USDC, 400e8); // pool 4400 / 100 = 44.00
+        _setBbo(42_600_000, 44_200_000); // mid 43.4, ask above the pool price
         vm.prank(keeper);
-        pool.order(false, 12e6);
-        assertEq(writer.sent(0), _order(true, 42e8, 0.28e8));
-    }
-
-    function test_tickRounding() public {
-        // 41.854 × 0.99 = 41.43546 -> 5 significant figures, rounded up for a sell -> 41.436
-        _setCoreBal(HYPE, 1e6 + 1e8);
-        _setCorePx(41_854_000);
-        vm.prank(keeper);
-        pool.order(true, 1 ether);
-        assertEq(writer.sent(0), _order(false, 41.436e8, 1e8));
+        pool.order(false, 30e6); // du = (4400 − 4340) / 2 = 30
+        // capped at the pool price 44.00; 30 / 44 = 0.6818 -> 0.68
+        assertEq(writer.sent(0), _order(true, 44e8, 0.68e8));
     }
 
     function test_dustOrderRefused() public {

@@ -28,6 +28,9 @@ library Core {
     address internal constant WITHDRAWABLE = 0x0000000000000000000000000000000000000803;
     address internal constant ORACLE_PX = 0x0000000000000000000000000000000000000807;
     address internal constant SPOT_PX = 0x0000000000000000000000000000000000000808;
+    /// Best bid/ask. Takes the order asset id (spot: 10000 + spot index); not in the official
+    /// docs, checked against the testnet book on 2026-10-17.
+    address internal constant BBO = 0x000000000000000000000000000000000000080e;
     address internal constant ACCOUNT_MARGIN_SUMMARY = 0x000000000000000000000000000000000000080F;
     address internal constant CORE_USER_EXISTS = 0x0000000000000000000000000000000000000810;
 
@@ -137,9 +140,14 @@ library Core {
         return abi.decode(_read(ORACLE_PX, abi.encode(perp)), (uint64));
     }
 
-    /// Spot prices come back with `8 - szDecimals(base)` decimals.
+    /// Last trade price, `8 - szDecimals(base)` decimals. Can sit at one side of a wide book.
     function spotPx(uint64 spotIndex) internal view returns (uint64) {
         return abi.decode(_read(SPOT_PX, abi.encode(spotIndex)), (uint64));
+    }
+
+    /// Spot: 8 - szDecimals(base) decimals, like `spotPx`.
+    function bbo(uint32 asset) internal view returns (uint64 bid, uint64 ask) {
+        return abi.decode(_read(BBO, abi.encode(asset)), (uint64, uint64));
     }
 
     function userExists(address user) internal view returns (bool) {
