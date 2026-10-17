@@ -44,5 +44,6 @@ How far to rebalance: only toward the Core price, never past it — the amount t
   EVM USDC 6.
 
 ## Open
-- USDC EVM → Core through the deposit wallet: see the bridging run.
+- **USDC EVM → Core into a contract's Core account did not arrive on testnet** (docs/step1-bridging.md).
+  The buy-HYPE leg (`start(false, …)`) as written depends on it and must change before testnet.
 - Whether a keeper can be made permissionless (bounded by the 0x808 price and per-call caps).
