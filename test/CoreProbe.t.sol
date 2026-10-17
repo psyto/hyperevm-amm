@@ -55,6 +55,20 @@ contract CoreProbeTest is Test {
         );
     }
 
+    function test_sendAssetBytes() public {
+        probe.sendAsset(Core.HYPE_SYSTEM, Core.SPOT_DEX, Core.SPOT_DEX, 1105, 1e7);
+        assertEq(
+            writer.sent(0),
+            abi.encodePacked(
+                hex"0100000d",
+                abi.encode(Core.HYPE_SYSTEM, address(0), type(uint32).max, type(uint32).max, uint64(1105), uint64(1e7))
+            )
+        );
+        assertEq(Core.systemAddress(0, 1105), 0x2000000000000000000000000000000000000000);
+        assertEq(Core.systemAddress(7, 1105), 0x2000000000000000000000000000000000000007);
+        assertEq(Core.systemAddress(1105, 1105), Core.HYPE_SYSTEM);
+    }
+
     function test_onlyOwner() public {
         vm.prank(address(0xBAD));
         vm.expectRevert(CoreProbe.NotOwner.selector);

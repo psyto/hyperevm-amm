@@ -5,6 +5,17 @@ interface ICoreWriter {
     function sendRawAction(bytes calldata data) external;
 }
 
+/// USDC's EVM -> Core path (testnet 0x0B80…C206, mainnet 0x6B9E…0A24).
+interface ICoreDepositWallet {
+    function deposit(uint256 amount, uint32 destinationDex) external;
+}
+
+interface IERC20 {
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address who) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
 /// @notice Writes to HyperCore (CoreWriter actions) and reads it back (precompiles).
 /// Writes are fire-and-forget: they run on HyperCore after this EVM block, order actions a few
 /// seconds later, with no return value and no revert here if HyperCore rejects them. Reads in the
@@ -16,6 +27,7 @@ library Core {
     address internal constant SPOT_BALANCE = 0x0000000000000000000000000000000000000801;
     address internal constant WITHDRAWABLE = 0x0000000000000000000000000000000000000803;
     address internal constant ORACLE_PX = 0x0000000000000000000000000000000000000807;
+    address internal constant SPOT_PX = 0x0000000000000000000000000000000000000808;
     address internal constant ACCOUNT_MARGIN_SUMMARY = 0x000000000000000000000000000000000000080F;
     address internal constant CORE_USER_EXISTS = 0x0000000000000000000000000000000000000810;
 
@@ -23,6 +35,13 @@ library Core {
     uint24 internal constant SPOT_SEND = 6;
     uint24 internal constant USD_CLASS_TRANSFER = 7;
     uint24 internal constant CANCEL_BY_CLOID = 11;
+    uint24 internal constant SEND_ASSET = 13;
+
+    /// HYPE sent here on the EVM arrives on Core; HYPE sent here on Core arrives on the EVM.
+    address internal constant HYPE_SYSTEM = 0x2222222222222222222222222222222222222222;
+    /// Other tokens: 0x20 followed by the token index (USDC = token 0).
+    uint160 internal constant BASE_SYSTEM = uint160(0x2000000000000000000000000000000000000000);
+    uint32 internal constant SPOT_DEX = type(uint32).max;
 
     uint8 internal constant TIF_ALO = 1;
     uint8 internal constant TIF_GTC = 2;
@@ -82,6 +101,16 @@ library Core {
         WRITER.sendRawAction(encode(SPOT_SEND, abi.encode(to, token, amountWei)));
     }
 
+    /// Move `amountWei` of `token` between dexes or accounts on Core. Sending to a token's system
+    /// address on the spot dex bridges it to the same address on the EVM.
+    function sendAsset(address to, uint32 srcDex, uint32 dstDex, uint64 token, uint64 amountWei) internal {
+        WRITER.sendRawAction(encode(SEND_ASSET, abi.encode(to, address(0), srcDex, dstDex, token, amountWei)));
+    }
+
+    function systemAddress(uint64 token, uint64 hypeToken) internal pure returns (address) {
+        return token == hypeToken ? HYPE_SYSTEM : address(BASE_SYSTEM + uint160(token));
+    }
+
     function _read(address precompile, bytes memory input) private view returns (bytes memory out) {
         bool ok;
         (ok, out) = precompile.staticcall(input);
@@ -106,6 +135,11 @@ library Core {
 
     function oraclePx(uint32 perp) internal view returns (uint64) {
         return abi.decode(_read(ORACLE_PX, abi.encode(perp)), (uint64));
+    }
+
+    /// Spot prices come back with `8 - szDecimals(base)` decimals.
+    function spotPx(uint64 spotIndex) internal view returns (uint64) {
+        return abi.decode(_read(SPOT_PX, abi.encode(spotIndex)), (uint64));
     }
 
     function userExists(address user) internal view returns (bool) {
