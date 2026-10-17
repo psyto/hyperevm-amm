@@ -232,13 +232,16 @@ contract HedgedPool {
         return nowBal > coreBefore ? nowBal - coreBefore : 0;
     }
 
-    /// Step 2: one IOC on the Core spot market for what arrived, limit `SLIPPAGE_BPS` off the
-    /// Core price read now. Reverts if the price has since moved so that the trade would push the
-    /// pool the wrong way; the keeper then calls `sendBack` to bring the tokens home untraded.
+    /// Step 2: one IOC on the Core spot market, limit `SLIPPAGE_BPS` off the Core price read now
+    /// but never worse than the pool's own price: CoreWriter orders run seconds later, so the
+    /// limit is what protects LPs if the price turns in between (review r2). Reverts if the price
+    /// has already turned; the keeper then calls `sendBack` to bring the HYPE home untraded.
     function order() external at(Stage.OnCore) {
         uint256 p = corePx(); // 6 decimals
         uint256 h = sellingHype ? rH + inFlight : rH;
-        (bool dir, uint256 max) = _maxRebalance(h, reserveU(), p);
+        uint256 u = reserveU();
+        uint256 pool = u * 1e18 / h; // pool price before this trade, 6 decimals
+        (bool dir, uint256 max) = _maxRebalance(h, u, p);
         if (dir != sellingHype || max == 0) revert WrongDirection();
 
         uint64 lotWei = uint64(10 ** (8 - hypeSzDecimals)); // size step, in 1e8 units
@@ -249,14 +252,16 @@ contract HedgedPool {
             uint256 cap = max / 1e10; // 18 -> 8 decimals
             sz = uint64(got < cap ? got : cap) / lotWei * lotWei;
             limit = p * (10_000 - SLIPPAGE_BPS) / 10_000;
+            if (limit < pool) limit = pool; // never sell below the pool price
         } else {
             uint256 spend = _min(_min(inFlight, max), coreU()) * 100; // USDC, 8 decimals
             limit = p * (10_000 + SLIPPAGE_BPS) / 10_000;
+            if (limit > pool) limit = pool; // never buy above the pool price
             // HYPE (1e8 units) = USDC (1e8) / price (1e6) * 1e6
             sz = uint64(spend * 1e6 / limit) / lotWei * lotWei;
         }
         if (sz == 0 || uint256(sz) * p / 1e8 < MIN_NOTIONAL) revert NotYet();
-        uint64 px = _toTick(limit * 100); // 6 -> 8 decimals, valid Core price
+        uint64 px = _toTick(limit * 100, sellingHype); // 6 -> 8 decimals; round away from a loss
         Core.limitOrder(uint32(10_000 + spotIndex), !sellingHype, px, sz, false, Core.TIF_IOC, 0);
         orderedAt = block.timestamp;
         stage = Stage.Ordered;
@@ -315,9 +320,9 @@ contract HedgedPool {
         emit Rebalance(Stage.Idle, h, u);
     }
 
-    /// Round down to 5 significant figures and at most `8 - szDecimals` decimals (Core spot
-    /// tick rules). `px8` has 8 decimals.
-    function _toTick(uint256 px8) internal view returns (uint64) {
+    /// Round to 5 significant figures and at most `8 - szDecimals` decimals (Core spot tick
+    /// rules), up for a sell limit and down for a buy limit. `px8` has 8 decimals.
+    function _toTick(uint256 px8, bool up) internal view returns (uint64) {
         uint256 step = 10 ** hypeSzDecimals; // max decimals 8 - szDecimals
         uint256 digits;
         for (uint256 x = px8; x > 0; x /= 10) digits++;
@@ -326,7 +331,8 @@ contract HedgedPool {
             uint256 sig = 10 ** (digits - 5);
             if (sig > step) step = sig;
         }
-        return uint64(px8 / step * step);
+        uint256 down = px8 / step * step;
+        return uint64(up && down < px8 ? down + step : down);
     }
 
     // ---------------------------------------------------------------- helpers

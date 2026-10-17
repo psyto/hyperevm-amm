@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {Core, IERC20} from "../../src/Core.sol";
+import {HedgedPool} from "../../src/HedgedPool.sol";
+
+contract R2Usdc {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+/// Models the documented contract-account deposit path: it takes the EVM tokens but supplies no
+/// Core credit.  A later _setCoreBalance models a delayed Core credit.
+contract R2DepositWallet {
+    R2Usdc internal immutable usdc;
+
+    constructor(R2Usdc usdc_) {
+        usdc = usdc_;
+    }
+
+    function deposit(uint256 amount, uint32) external {
+        usdc.transferFrom(msg.sender, address(this), amount);
+    }
+}
+
+contract R2Writer {
+    bytes[] internal actions;
+
+    function sendRawAction(bytes calldata action) external {
+        actions.push(action);
+    }
+
+    function sent(uint256 i) external view returns (bytes memory) {
+        return actions[i];
+    }
+}
+
+contract Round2StateMachinePoC is Test {
+    uint64 internal constant HYPE = 1105;
+    uint64 internal constant SPOT = 1035;
+    address internal constant KEEPER = address(0xC0FFEE);
+    address internal constant LP = address(0xBEEF);
+
+    R2Usdc internal usdc;
+    HedgedPool internal pool;
+
+    function setUp() public {
+        vm.etch(address(Core.WRITER), address(new R2Writer()).code);
+        usdc = new R2Usdc();
+        pool = new HedgedPool(IERC20(address(usdc)), address(new R2DepositWallet(usdc)), KEEPER, HYPE, SPOT, 2);
+
+        vm.deal(LP, 100 ether);
+        usdc.mint(LP, 4_000e6);
+        vm.startPrank(LP);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.add{value: 100 ether}(4_000e6, 0);
+        vm.stopPrank();
+
+        _setCoreBalance(HYPE, pool.KEEP_HYPE_WEI());
+        _setCoreBalance(Core.USDC, 0);
+    }
+
+    function _setCorePx(uint64 px6) internal {
+        vm.mockCall(Core.SPOT_PX, abi.encode(SPOT), abi.encode(px6));
+    }
+
+    function _setCoreBalance(uint64 token, uint64 amount8) internal {
+        vm.mockCall(
+            Core.SPOT_BALANCE, abi.encode(address(pool), token), abi.encode(Core.SpotBalance(amount8, 0, 0))
+        );
+    }
+
+    /// The round-one direction check happens before the delayed CoreWriter order runs.  With a
+    /// small enough initial price gap, its 1% sell limit is already below the pool's total
+    /// inventory price; a price reversal in Core's documented delay can therefore fill an order
+    /// that sells HYPE into the wrong side of the AMM.
+    function test_PoC_iocLimitCrossesPoolPriceDuringCoreWriterDelay() public {
+        _setCorePx(40_300_000); // just 0.75% above the 40.00 pool price
+
+        vm.prank(KEEPER);
+        pool.start(true, 0.3 ether); // $12.09, so it passes MIN_NOTIONAL
+        _setCoreBalance(HYPE, uint64(pool.KEEP_HYPE_WEI()) + 30_000_000);
+
+        vm.prank(KEEPER);
+        pool.order();
+
+        // The action accepts a fill at 39.897 USDC/HYPE.  Total pool inventory immediately
+        // before execution is 100 HYPE and 4,000 USDC, i.e. 40.000 USDC/HYPE.
+        uint64 limitPx8 = 39_897e5;
+        assertLt(uint256(limitPx8), 40_000_000 * 100, "IOC may sell below the pool price");
+        assertEq(
+            R2Writer(address(Core.WRITER)).sent(0),
+            abi.encodePacked(
+                hex"01000001",
+                abi.encode(uint32(11_035), false, limitPx8, uint64(30_000_000), false, uint8(3), uint128(0))
+            )
+        );
+    }
+
+    /// Giving up an unarrived EVM->Core deposit restores Idle based only on EVM balances.  If the
+    /// credit arrives later, it is no longer in expectU, no function reconciles it, and LP NAV
+    /// remains $100 lower while the Core account holds the missing USDC.
+    function test_PoC_lateBridgeAfterStuckDelayIsUnaccounted() public {
+        _setCorePx(38_000_000);
+        vm.prank(KEEPER);
+        pool.start(false, 100e6);
+
+        skip(pool.STUCK_DELAY());
+        vm.startPrank(KEEPER);
+        pool.sendBack();
+        pool.finish();
+        vm.stopPrank();
+
+        assertEq(uint8(pool.stage()), uint8(HedgedPool.Stage.Idle));
+        assertEq(pool.rU(), 3_900e6, "the bridge is booked as a loss");
+
+        // The same deposit is credited after the abandonment transition.  It is a pool-owned
+        // Core balance, but rU remains unchanged and Idle has no reconciliation path.
+        _setCoreBalance(Core.USDC, 100e8);
+        assertEq(Core.spotBalance(address(pool), Core.USDC).total, 100e8);
+        assertEq(pool.rU(), 3_900e6, "late Core funds are excluded from LP accounting");
+    }
+}

@@ -291,14 +291,14 @@ contract HedgedPoolTest is Test {
     }
 
     function test_tickRounding() public {
-        // 41.854 × 0.99 = 41.43546 -> 5 significant figures -> 41.435
+        // 41.854 × 0.99 = 41.43546 -> 5 significant figures, rounded up for a sell -> 41.436
         _setCorePx(41_854_000);
         vm.prank(keeper);
         pool.start(true, 1 ether);
         _setCoreBal(HYPE, 1e6 + 1e8);
         vm.prank(keeper);
         pool.order();
-        assertEq(writer.sent(0), _order(false, 41.435e8, 1e8));
+        assertEq(writer.sent(0), _order(false, 41.436e8, 1e8));
     }
 
     // ------------------------------------------------------------ review r1 (fixed, kept)
@@ -389,5 +389,51 @@ contract HedgedPoolTest is Test {
         assertEq(Core.HYPE_SYSTEM.balance, 0.05 ether);
         assertEq(pool.rH(), 100 ether);
         assertEq(address(pool).balance, 100 ether);
+    }
+
+    // ------------------------------------------------------------ review r2
+
+    /// r2 high: the IOC runs seconds after `order`; its limit must not cross the pool price.
+    function test_r2_sellLimitNeverBelowPool() public {
+        _setCorePx(40_300_000); // 0.75% above the 40.00 pool price; Core − 1% would be 39.897
+        vm.prank(keeper);
+        pool.start(true, 0.3 ether);
+        _setCoreBal(HYPE, 1e6 + 0.3e8);
+        vm.prank(keeper);
+        pool.order();
+        assertEq(writer.sent(0), _order(false, 40e8, 0.3e8));
+    }
+
+    function test_r2_buyLimitNeverAbovePool() public {
+        _setCoreBal(Core.USDC, 200e8); // pool 42.00; Core 41.7 + 1% would be 42.117
+        _setCorePx(41_700_000);
+        vm.prank(keeper);
+        pool.start(false, 12e6);
+        vm.prank(keeper);
+        pool.order();
+        // limit capped at 42.00; 12 / 42 = 0.2857 -> 0.28
+        assertEq(writer.sent(0), _order(true, 42e8, 0.28e8));
+    }
+
+    /// r2 high (late bridge): HYPE that lands on Core after the bridge was given up is brought
+    /// back by `sendBack` from Idle and re-enters the reserves.
+    function test_r2_lateHypeRecoveredFromIdle() public {
+        _setCorePx(42_000_000);
+        vm.prank(keeper);
+        pool.start(true, 2 ether);
+        skip(pool.STUCK_DELAY());
+        vm.startPrank(keeper);
+        pool.sendBack(0);
+        pool.finish();
+        assertEq(pool.rH(), 98 ether);
+
+        _setCoreBal(HYPE, 1e6 + 2e8); // the bridge lands late
+        pool.sendBack(0);
+        assertEq(writer.sent(0), _send(Core.HYPE_SYSTEM, HYPE, 2e8));
+        assertEq(pool.expectH(), 100 ether);
+        vm.deal(address(pool), 100 ether);
+        pool.finish();
+        vm.stopPrank();
+        assertEq(pool.rH(), 100 ether);
     }
 }
